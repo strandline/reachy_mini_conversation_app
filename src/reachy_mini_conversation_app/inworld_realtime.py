@@ -50,12 +50,23 @@ class _InworldAsyncRealtime(AsyncRealtime):
         extra_headers: Any = None,
         websocket_connection_options: Any = None,
     ) -> AsyncRealtimeConnectionManager:
-        """Return an `_InworldConnectionManager` instead of the SDK default."""
+        """Return an `_InworldConnectionManager` with Basic auth injected.
+
+        The SDK builds the WS auth header from `client.auth_headers` (which is
+        always `Bearer <api_key>`); `default_headers` passed to AsyncOpenAI()
+        only flows to HTTP REST, not WebSocket. To send `Authorization: Basic
+        <key>`, we put it in `extra_headers`, which the SDK merges *after*
+        auth_headers and therefore overrides it.
+        """
+        merged_headers = dict(extra_headers) if extra_headers else {}
+        basic_auth = getattr(self._client, "_inworld_basic_auth", None)
+        if basic_auth:
+            merged_headers["Authorization"] = basic_auth
         ws_opts = websocket_connection_options if websocket_connection_options is not None else {}
         return _InworldConnectionManager(
             client=self._client,
             extra_query=extra_query if extra_query is not None else {},
-            extra_headers=extra_headers if extra_headers is not None else {},
+            extra_headers=merged_headers,
             websocket_connection_options=ws_opts,  # type: ignore[arg-type]
             call_id=call_id,
             model=model,
@@ -64,6 +75,11 @@ class _InworldAsyncRealtime(AsyncRealtime):
 
 class _InworldAsyncOpenAI(AsyncOpenAI):
     """`AsyncOpenAI` subclass that exposes Inworld's URL/auth via `.realtime`."""
+
+    def __init__(self, *, inworld_basic_auth: str, **kwargs: Any) -> None:
+        """Store the `Basic <base64-key>` header so `.realtime.connect()` can inject it."""
+        super().__init__(**kwargs)
+        self._inworld_basic_auth = inworld_basic_auth
 
     @cached_property
     def realtime(self) -> _InworldAsyncRealtime:
@@ -147,10 +163,10 @@ class InworldRealtimeHandler(BaseRealtimeHandler):
                 "https://studio.inworld.ai > API Keys) to use BACKEND_PROVIDER=inworld."
             )
         client = _InworldAsyncOpenAI(
-            api_key="UNUSED",  # overridden by default_headers
+            api_key="UNUSED",  # SDK's Bearer auth is overridden via inworld_basic_auth
             base_url=INWORLD_HTTP_BASE,
             websocket_base_url=INWORLD_WS_BASE,
-            default_headers={"Authorization": f"Basic {api_key}"},
+            inworld_basic_auth=f"Basic {api_key}",
         )
         # Inworld's URL needs ?key=<session_id>&protocol=realtime; the base
         # class forwards self._realtime_connect_query as extra_query on connect.
