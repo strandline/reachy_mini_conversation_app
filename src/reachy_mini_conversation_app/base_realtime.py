@@ -240,6 +240,46 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         self.last_activity_time = asyncio.get_event_loop().time()
         logger.debug("last activity time updated to %s (%s)", self.last_activity_time, reason)
 
+    def _maybe_update_voice_profile(self, event: Any) -> None:
+        """Extract Inworld's `voiceProfile` extra from a transcription event.
+
+        The OpenAI SDK's event classes are Pydantic models with `extra='allow'`,
+        so backend-specific extras like Inworld's voice classification ride
+        through and are reachable via the event's `model_extra` or as direct
+        attributes. Other backends don't emit voiceProfile, so this is a no-op
+        for them.
+        """
+        if self.deps.voice_profile_store is None:
+            return
+        # camelCase wire field (per Inworld docs); fall back to snake_case.
+        payload: Any = getattr(event, "voiceProfile", None) or getattr(event, "voice_profile", None)
+        if payload is None:
+            extras = getattr(event, "model_extra", None)
+            if isinstance(extras, dict):
+                payload = extras.get("voiceProfile") or extras.get("voice_profile")
+        if payload is None:
+            return
+        # Pydantic may wrap nested objects as models; convert to plain dict.
+        if hasattr(payload, "model_dump"):
+            try:
+                payload = payload.model_dump()
+            except Exception:
+                pass
+        from reachy_mini_conversation_app.voice_profile import parse_voice_profile
+
+        profile = parse_voice_profile(payload)
+        if profile is None:
+            return
+        self.deps.voice_profile_store.update(profile)
+        logger.info(
+            "VoiceProfile: age=%s emotion=%s pitch=%s style=%s accent=%s",
+            profile.top_age(),
+            profile.top_emotion(),
+            profile.top_pitch(),
+            profile.top_vocal_style(),
+            profile.top_accent(),
+        )
+
     def copy(self) -> "BaseRealtimeHandler":
         """Create a copy of the handler."""
         return type(self)(
@@ -785,6 +825,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         transcript = raw_transcript.strip()
                         logger.debug("User transcript: %s", raw_transcript)
                         self.deps.movement_manager.set_listening(False)
+
+                        # Inworld voice-profile extension: classification ride-alongs on
+                        # the transcription completion event. Other backends don't emit
+                        # this, so the lookup harmlessly returns None.
+                        self._maybe_update_voice_profile(event)
 
                         # Cancel any pending partial emission
                         if self.partial_transcript_task and not self.partial_transcript_task.done():

@@ -144,7 +144,16 @@ class InworldRealtimeHandler(BaseRealtimeHandler):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": rate},
-                    "transcription": {"model": INWORLD_STT_MODEL},
+                    "transcription": {
+                        "model": INWORLD_STT_MODEL,
+                        # https://docs.inworld.ai/stt/voice-profiles — per-utterance
+                        # age/emotion/pitch/vocalStyle/accent classification piggybacks
+                        # on transcription. Returned payload populates VoiceProfileStore.
+                        "voiceProfileConfig": {
+                            "enableVoiceProfile": True,
+                            "topN": 5,
+                        },
+                    },
                     "turn_detection": {
                         "type": "semantic_vad",
                         "eagerness": "high",
@@ -159,7 +168,9 @@ class InworldRealtimeHandler(BaseRealtimeHandler):
                 },
             },
             "providerData": {
-                "stt": {"voice_profile": False},
+                # Older realtime-API path for the same toggle; harmless to also
+                # set in case the new voiceProfileConfig location is ignored.
+                "stt": {"voice_profile": True},
             },
             "tools": to_realtime_tools_config(tool_specs),
             "tool_choice": "auto",

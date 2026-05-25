@@ -58,6 +58,10 @@ class ToolDependencies:
     vision_processor: Any | None = None
     head_wobbler: Any | None = None  # HeadWobbler for audio-reactive motion
     motion_duration_s: float = 1.0
+    # Latest speaker voice classification (Inworld STT only; see
+    # reachy_mini_conversation_app.voice_profile for the VoiceProfileStore type).
+    # Typed Any to avoid a circular import — the type is duck-checked at use sites.
+    voice_profile_store: Any | None = None
 
 
 # Tool base class
