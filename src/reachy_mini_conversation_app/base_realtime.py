@@ -240,41 +240,6 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         self.last_activity_time = asyncio.get_event_loop().time()
         logger.debug("last activity time updated to %s (%s)", self.last_activity_time, reason)
 
-    def _sniff_voice_profile_anywhere(self, event: Any) -> None:
-        """Diagnostic — log if any event carries a voiceProfile-like field.
-
-        Runs on every event in the loop. Silent unless a hit is found. Used
-        during Inworld voice-profile bring-up to discover where Inworld puts
-        the payload (transcription.completed? a custom event type? extras?).
-        Strip this method and its call site once the path is confirmed.
-        """
-        if self.deps.voice_profile_store is None:
-            return
-        candidates: list[tuple[str, Any]] = []
-        for attr in ("voiceProfile", "voice_profile"):
-            val = getattr(event, attr, None)
-            if val is not None:
-                candidates.append((f"attr:{attr}", val))
-        extras = getattr(event, "model_extra", None)
-        if isinstance(extras, dict):
-            for k in ("voiceProfile", "voice_profile"):
-                if k in extras and extras[k] is not None:
-                    candidates.append((f"extras:{k}", extras[k]))
-        if not candidates:
-            return
-        # Log the first hit; usually there's only one.
-        where, payload = candidates[0]
-        try:
-            preview = repr(payload)[:300]
-        except Exception:
-            preview = "(unrepr-able)"
-        logger.info(
-            "[VP_SNIFF] Found voiceProfile on event type=%s at %s: %s",
-            event.type,
-            where,
-            preview,
-        )
-
     def _maybe_update_voice_profile(self, event: Any) -> None:
         """Extract Inworld's `voiceProfile` extra from a transcription event.
 
@@ -333,26 +298,8 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         break
 
         if payload is None:
-            # Diagnostic: dump providerData so we can see what's actually in it.
-            extras = getattr(event, "model_extra", None)
-            provider_data = (
-                getattr(event, "providerData", None)
-                or (extras.get("providerData") if isinstance(extras, dict) else None)
-            )
-            try:
-                if hasattr(provider_data, "model_dump"):
-                    pd_dump = provider_data.model_dump()
-                elif isinstance(provider_data, dict):
-                    pd_dump = provider_data
-                else:
-                    pd_dump = repr(provider_data)
-                pd_preview = repr(pd_dump)[:600]
-            except Exception:
-                pd_preview = "(unrepr-able)"
-            logger.info(
-                "[VP_DIAG] transcription.completed had no voiceProfile | providerData=%s",
-                pd_preview,
-            )
+            # No voice profile on this event — normal on non-Inworld backends or
+            # when Inworld couldn't classify the utterance. Stay silent.
             return
         # Pydantic may wrap nested objects as models; convert to plain dict.
         if hasattr(payload, "model_dump"):
@@ -839,12 +786,6 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
 
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
-
-                    # Diagnostic sniffer: log any event that carries a
-                    # voiceProfile-like payload, regardless of event type. Stays
-                    # silent otherwise. Strip after Inworld voice-profile path
-                    # is confirmed.
-                    self._sniff_voice_profile_anywhere(event)
 
                     if event.type == "input_audio_buffer.speech_started":
                         self._mark_activity("user_speech_started")
