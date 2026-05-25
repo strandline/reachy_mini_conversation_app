@@ -93,8 +93,9 @@ DEFAULT_BACKEND_PROVIDER = HF_BACKEND
 
 # Curated voice list for Inworld TTS (inworld-tts-2). Inworld's full catalog has
 # 80+ voices; expand here as needed. See https://studio.inworld.ai for previews.
-INWORLD_DEFAULT_VOICE = "Ashley"
+INWORLD_DEFAULT_VOICE = "Minji"
 INWORLD_AVAILABLE_VOICES = [
+    "Minji",
     "Ashley",
     "Clive",
     "Edward",
@@ -104,7 +105,7 @@ INWORLD_AVAILABLE_VOICES = [
     "Theodore",
     "Wendy",
 ]
-INWORLD_DEFAULT_LLM = "openai/gpt-4o-mini"
+INWORLD_DEFAULT_LLM = "openai/gpt-4.1-mini"
 HF_REALTIME_CONNECTION_MODE_ENV = "HF_REALTIME_CONNECTION_MODE"
 HF_REALTIME_WS_URL_ENV = "HF_REALTIME_WS_URL"
 HF_LOCAL_CONNECTION_MODE = "local"

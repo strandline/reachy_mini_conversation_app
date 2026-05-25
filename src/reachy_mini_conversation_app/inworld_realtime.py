@@ -25,9 +25,13 @@ __all__ = ["InworldRealtimeHandler"]
 
 INWORLD_WS_BASE = "wss://api.inworld.ai/api/v1"
 INWORLD_HTTP_BASE = "https://api.inworld.ai/api/v1"
-INWORLD_DEFAULT_LLM = "openai/gpt-4o-mini"
+INWORLD_DEFAULT_LLM = "openai/gpt-4.1-mini"
+INWORLD_STT_MODEL = "assemblyai/u3-rt-pro"
 INWORLD_TTS_MODEL = "inworld-tts-2"
-INWORLD_OUTPUT_SAMPLE_RATE = 16000
+# 16 kHz PCM for parity with the Reachy Mini audio pipeline. Inworld's server
+# defaults to 24 kHz but accepts explicit rate via `audio.{in,out}.format.rate`
+# in session.update.
+INWORLD_SAMPLE_RATE = 16000
 
 
 class _InworldConnectionManager(AsyncRealtimeConnectionManager):
@@ -98,7 +102,7 @@ class InworldRealtimeHandler(BaseRealtimeHandler):
     """
 
     BACKEND_PROVIDER = INWORLD_BACKEND
-    SAMPLE_RATE = INWORLD_OUTPUT_SAMPLE_RATE
+    SAMPLE_RATE = INWORLD_SAMPLE_RATE
     REFRESH_CLIENT_ON_RECONNECT = False
     # Inworld's published pricing varies by routed model; leave as 0 until we
     # wire per-model accounting. The conv app's cost display will just show $0.
@@ -121,11 +125,17 @@ class InworldRealtimeHandler(BaseRealtimeHandler):
         """Return the Inworld realtime session config.
 
         Returned as a plain dict (rather than the OpenAI TypedDicts the other
-        handlers use) because Inworld's schema adds `audio.output.model` and
-        a session-level `model` field that aren't in the OpenAI TypedDict
-        definitions.
+        handlers use) because Inworld's schema diverges from OpenAI's:
+        `audio.output.model` (TTS routing), a session-level `model` for LLM
+        routing, `providerData.stt.voice_profile`, and a different default
+        transcription model (no `gpt-4o-transcribe` — Inworld uses providers
+        like `assemblyai/u3-rt-pro`).
+
+        Audio format is set explicitly to 16 kHz PCM (Inworld's server default
+        is 24 kHz, but the API accepts an explicit rate). This matches
+        `SAMPLE_RATE = INWORLD_SAMPLE_RATE` and the Reachy Mini audio path.
         """
-        rate = INWORLD_OUTPUT_SAMPLE_RATE
+        rate = INWORLD_SAMPLE_RATE
         return {
             "type": "realtime",
             "model": config.MODEL_NAME or INWORLD_DEFAULT_LLM,
@@ -134,14 +144,22 @@ class InworldRealtimeHandler(BaseRealtimeHandler):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": rate},
-                    "transcription": {"model": "gpt-4o-transcribe", "language": "en"},
-                    "turn_detection": {"type": "server_vad", "interrupt_response": True},
+                    "transcription": {"model": INWORLD_STT_MODEL},
+                    "turn_detection": {
+                        "type": "semantic_vad",
+                        "eagerness": "high",
+                        "create_response": True,
+                        "interrupt_response": True,
+                    },
                 },
                 "output": {
                     "format": {"type": "audio/pcm", "rate": rate},
                     "model": INWORLD_TTS_MODEL,
                     "voice": self.get_current_voice(),
                 },
+            },
+            "providerData": {
+                "stt": {"voice_profile": False},
             },
             "tools": to_realtime_tools_config(tool_specs),
             "tool_choice": "auto",
