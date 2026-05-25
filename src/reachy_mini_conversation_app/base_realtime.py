@@ -895,7 +895,7 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
                         self._mark_activity("assistant_transcript_done")
-                        logger.debug(f"Assistant transcript: {event.transcript}")
+                        logger.info("Assistant transcript: %s", event.transcript)
                         await self.output_queue.put(
                             AdditionalOutputs({"role": "assistant", "content": event.transcript})
                         )
