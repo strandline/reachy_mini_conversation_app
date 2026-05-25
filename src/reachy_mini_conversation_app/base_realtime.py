@@ -681,6 +681,12 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             # Reset the partial-transcript accumulator for each new session
             self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
 
+            # Track function-call names by call_id from response.output_item.added
+            # events, so .function_call_arguments.done dispatch can fall back to
+            # this dict when the .done event omits the `name` field. (Inworld
+            # observed dropping name in the .done event; OpenAI/Gemini set both.)
+            self._function_call_names_by_call_id: dict[str, str] = {}
+
             # Manage events received from the realtime server.
             self.connection = conn
             try:
@@ -824,11 +830,27 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                             ),
                         )
                     # ---- tool-calling plumbing ----
+                    # Capture function names as they're announced (Inworld emits
+                    # the name here but later omits it from .arguments.done; OpenAI
+                    # populates both, so this is a no-op there).
+                    if event.type == "response.output_item.added":
+                        item = getattr(event, "item", None)
+                        if item is not None and getattr(item, "type", None) == "function_call":
+                            item_call_id = getattr(item, "call_id", None)
+                            item_name = getattr(item, "name", None)
+                            if isinstance(item_call_id, str) and isinstance(item_name, str):
+                                self._function_call_names_by_call_id[item_call_id] = item_name
+
                     if event.type == "response.function_call_arguments.done":
                         self._mark_activity("tool_call_received")
                         tool_name = getattr(event, "name", None)
                         args_json_str = getattr(event, "arguments", None)
                         call_id: str = str(getattr(event, "call_id", uuid.uuid4()))
+
+                        # Fall back to the name captured from output_item.added
+                        # if this event didn't carry it (Inworld behavior).
+                        if not isinstance(tool_name, str) or not tool_name:
+                            tool_name = self._function_call_names_by_call_id.get(call_id)
 
                         logger.info(
                             "Tool call received — tool_name=%r, call_id=%s, is_idle=%s, args=%s",
