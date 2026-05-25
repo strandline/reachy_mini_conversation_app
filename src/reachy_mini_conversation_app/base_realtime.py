@@ -281,31 +281,77 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         The OpenAI SDK's event classes are Pydantic models with `extra='allow'`,
         so backend-specific extras like Inworld's voice classification ride
         through and are reachable via the event's `model_extra` or as direct
-        attributes. Other backends don't emit voiceProfile, so this is a no-op
-        for them.
+        attributes. Inworld nests this data under `providerData` (the Inworld
+        catch-all for non-OpenAI fields) on transcription.completed events.
+        Other backends don't emit voiceProfile, so this is a no-op for them.
         """
         if self.deps.voice_profile_store is None:
             return
-        # camelCase wire field (per Inworld docs); fall back to snake_case.
-        payload: Any = getattr(event, "voiceProfile", None) or getattr(event, "voice_profile", None)
+
+        def _dig(container: Any) -> Any:
+            """Look for voiceProfile/voice_profile under attrs or dict keys."""
+            if container is None:
+                return None
+            # attribute access (pydantic model fields)
+            for key in ("voiceProfile", "voice_profile"):
+                val = getattr(container, key, None)
+                if val is not None:
+                    return val
+            # dict access
+            if isinstance(container, dict):
+                for key in ("voiceProfile", "voice_profile"):
+                    if container.get(key) is not None:
+                        return container[key]
+            return None
+
+        # 1. top-level (per Inworld docs the field is at event root, but in
+        #    practice it's been observed under providerData — check both).
+        payload: Any = _dig(event)
         if payload is None:
             extras = getattr(event, "model_extra", None)
             if isinstance(extras, dict):
-                payload = extras.get("voiceProfile") or extras.get("voice_profile")
+                payload = _dig(extras)
+
+        # 2. inside providerData (where Inworld actually stashes it).
         if payload is None:
-            # Diagnostic: dump the transcription event so we can see where (if at
-            # all) Inworld carries voiceProfile. Tag the line so it's grep-friendly.
+            provider_data = getattr(event, "providerData", None) or getattr(event, "provider_data", None)
+            if provider_data is None:
+                extras = getattr(event, "model_extra", None)
+                if isinstance(extras, dict):
+                    provider_data = extras.get("providerData") or extras.get("provider_data")
+            payload = _dig(provider_data)
+            # providerData may itself nest under `stt` or `transcription` — try one layer deeper.
+            if payload is None and provider_data is not None:
+                for nest_key in ("stt", "transcription"):
+                    inner = (
+                        getattr(provider_data, nest_key, None)
+                        if not isinstance(provider_data, dict)
+                        else provider_data.get(nest_key)
+                    )
+                    payload = _dig(inner)
+                    if payload is not None:
+                        break
+
+        if payload is None:
+            # Diagnostic: dump providerData so we can see what's actually in it.
             extras = getattr(event, "model_extra", None)
+            provider_data = (
+                getattr(event, "providerData", None)
+                or (extras.get("providerData") if isinstance(extras, dict) else None)
+            )
             try:
-                dump = event.model_dump() if hasattr(event, "model_dump") else None
-                dump_keys = sorted(dump.keys()) if isinstance(dump, dict) else None
+                if hasattr(provider_data, "model_dump"):
+                    pd_dump = provider_data.model_dump()
+                elif isinstance(provider_data, dict):
+                    pd_dump = provider_data
+                else:
+                    pd_dump = repr(provider_data)
+                pd_preview = repr(pd_dump)[:600]
             except Exception:
-                dump_keys = None
+                pd_preview = "(unrepr-able)"
             logger.info(
-                "[VP_DIAG] transcription.completed had no voiceProfile | "
-                "top-level keys=%s | extras=%s",
-                dump_keys,
-                sorted(extras.keys()) if isinstance(extras, dict) else None,
+                "[VP_DIAG] transcription.completed had no voiceProfile | providerData=%s",
+                pd_preview,
             )
             return
         # Pydantic may wrap nested objects as models; convert to plain dict.
