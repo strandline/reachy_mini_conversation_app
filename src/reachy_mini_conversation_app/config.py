@@ -88,7 +88,23 @@ GEMINI_AVAILABLE_VOICES: list[str] = [
 OPENAI_BACKEND = "openai"
 GEMINI_BACKEND = "gemini"
 HF_BACKEND = "huggingface"
+INWORLD_BACKEND = "inworld"
 DEFAULT_BACKEND_PROVIDER = HF_BACKEND
+
+# Curated voice list for Inworld TTS (inworld-tts-2). Inworld's full catalog has
+# 80+ voices; expand here as needed. See https://studio.inworld.ai for previews.
+INWORLD_DEFAULT_VOICE = "Ashley"
+INWORLD_AVAILABLE_VOICES = [
+    "Ashley",
+    "Clive",
+    "Edward",
+    "Hades",
+    "Diana",
+    "Olivia",
+    "Theodore",
+    "Wendy",
+]
+INWORLD_DEFAULT_LLM = "openai/gpt-4o-mini"
 HF_REALTIME_CONNECTION_MODE_ENV = "HF_REALTIME_CONNECTION_MODE"
 HF_REALTIME_WS_URL_ENV = "HF_REALTIME_WS_URL"
 HF_LOCAL_CONNECTION_MODE = "local"
@@ -116,16 +132,19 @@ DEFAULT_MODEL_NAME_BY_BACKEND = {
     OPENAI_BACKEND: "gpt-realtime-2",
     GEMINI_BACKEND: "gemini-3.1-flash-live-preview",
     HF_BACKEND: HF_DEFAULTS.model_name,
+    INWORLD_BACKEND: INWORLD_DEFAULT_LLM,
 }
 BACKEND_LABEL_BY_PROVIDER = {
     OPENAI_BACKEND: "OpenAI Realtime",
     GEMINI_BACKEND: "Gemini Live",
     HF_BACKEND: "Hugging Face",
+    INWORLD_BACKEND: "Inworld AI",
 }
 DEFAULT_VOICE_BY_BACKEND = {
     OPENAI_BACKEND: OPENAI_DEFAULT_VOICE,
     GEMINI_BACKEND: "Kore",
     HF_BACKEND: HF_DEFAULTS.voice,
+    INWORLD_BACKEND: INWORLD_DEFAULT_VOICE,
 }
 
 logger = logging.getLogger(__name__)
@@ -350,6 +369,7 @@ class Config:
     # Required (one of these depending on BACKEND_PROVIDER)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # The key is downloaded in console.py if needed
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    INWORLD_API_KEY = os.getenv("INWORLD_API_KEY")  # base64-encoded; from https://studio.inworld.ai
 
     # Optional
     BACKEND_PROVIDER = _normalize_backend_provider(
@@ -497,6 +517,8 @@ def get_available_voices_for_backend(backend: str | None = None) -> list[str]:
         return list(GEMINI_AVAILABLE_VOICES)
     if normalized_backend == HF_BACKEND:
         return list(HF_AVAILABLE_VOICES)
+    if normalized_backend == INWORLD_BACKEND:
+        return list(INWORLD_AVAILABLE_VOICES)
     return list(AVAILABLE_VOICES)
 
 

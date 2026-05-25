@@ -50,6 +50,7 @@ def run(
         HF_BACKEND,
         GEMINI_BACKEND,
         OPENAI_BACKEND,
+        INWORLD_BACKEND,
         HF_LOCAL_CONNECTION_MODE,
         config,
         is_gemini_model,
@@ -204,6 +205,19 @@ def run(
             transport_label,
         )
         handler = HuggingFaceRealtimeHandler(
+            deps,
+            gradio_mode=args.gradio,
+            instance_path=instance_path,
+            startup_voice=startup_settings.voice,
+        )  # type: ignore[assignment]
+    elif config.BACKEND_PROVIDER == INWORLD_BACKEND:
+        from reachy_mini_conversation_app.inworld_realtime import InworldRealtimeHandler
+
+        logger.info(
+            "Using %s via Inworld realtime handler (api.inworld.ai)",
+            get_backend_label(config.BACKEND_PROVIDER),
+        )
+        handler = InworldRealtimeHandler(
             deps,
             gradio_mode=args.gradio,
             instance_path=instance_path,

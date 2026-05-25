@@ -32,11 +32,15 @@ coverage.xml
 .ruff_cache/
 .mypy_cache/
 
-# IDE
+# IDE / agent tooling
 .vscode/
 .idea/
+.serena/
 *.swp
 *.swo
+
+# direnv (per-machine env loader)
+.envrc
 
 # Security
 *.key
@@ -60,3 +64,4 @@ cache/
 
 # User-created personalities (managed by UI)
 src/reachy_mini_conversation_app/profiles/user_personalities/
+profiles/user_personalities/
