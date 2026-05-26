@@ -1137,8 +1137,18 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         LLM pick freely (speech, tool, both, or nothing). The session-level
         instructions in the active profile own the actual behavior policy
         — see Bemo's "IDLE TIME" paragraph.
+
+        Sets ``is_idle_tool_call`` so any tool calls made in response to
+        the idle signal don't each trigger a follow-up ``response.create``
+        in ``_handle_tool_result``. Without that guard, every tool result
+        prompts a new "use the tool result and answer concisely in speech"
+        response — which cascades into runaway chatter when the LLM has
+        nothing meaningful to add but is told to speak anyway. With the
+        guard, all idle output (speech + tools) is contained in the single
+        response triggered by this signal.
         """
         logger.debug("Sending idle signal")
+        self.is_idle_tool_call = True
         timestamp_msg = (
             f"[Idle time update: {self.format_timestamp()} - "
             f"{idle_duration:.1f}s since last activity] "
