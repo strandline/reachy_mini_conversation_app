@@ -62,6 +62,11 @@ class ToolDependencies:
     # reachy_mini_conversation_app.voice_profile for the VoiceProfileStore type).
     # Typed Any to avoid a circular import — the type is duck-checked at use sites.
     voice_profile_store: Any | None = None
+    # Awaitable callable that re-issues session.update with freshly built
+    # instructions + dynamic state block. Wired by the active realtime handler
+    # so tools (e.g. reflect on mood_snapshot) can request a refresh after
+    # changing state that the state block reads. None when no session is live.
+    refresh_session_instructions: Any | None = None
 
 
 # Tool base class

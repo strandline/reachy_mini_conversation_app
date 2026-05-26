@@ -124,6 +124,9 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         )
 
         self.deps = deps
+        # Let external tools request a fresh session.update when state the
+        # state-block reads changes (e.g. mood_snapshot writes).
+        self.deps.refresh_session_instructions = self.refresh_session_instructions
 
         self.output_sample_rate = sample_rate
         self.input_sample_rate = sample_rate
@@ -219,6 +222,106 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
     @abstractmethod
     def _get_session_instructions(self) -> str:
         """Return session instructions for this backend."""
+
+    async def _read_latest_mood(self) -> dict[str, Any] | None:
+        """Best-effort read of Bemo's latest mood snapshot.
+
+        Returns None unless the external tools dir has _memory_store.py
+        loaded (its `latest_mood_snapshot()` is the contract). Soft
+        dependency: the conv app stays usable without external memory.
+        """
+        try:
+            import _memory_store  # type: ignore[import-not-found]
+        except ImportError:
+            return None
+        try:
+            return await _memory_store.latest_mood_snapshot()
+        except Exception:
+            logger.exception("latest_mood_snapshot failed")
+            return None
+
+    def _voice_profile_summary(self) -> str | None:
+        """Format the most recent user VoiceProfile as a one-line summary."""
+        store = self.deps.voice_profile_store
+        if store is None:
+            return None
+        profile = store.get_current()
+        if profile is None:
+            return None
+        bits: list[str] = []
+        emotion = profile.top_emotion()
+        if emotion:
+            bits.append(emotion)
+        pitch = profile.top_pitch()
+        if pitch:
+            bits.append(f"{pitch} pitch")
+        style = profile.top_vocal_style()
+        if style:
+            bits.append(style)
+        return ", ".join(bits) if bits else None
+
+    async def _build_state_block(self) -> str:
+        """Return the CURRENT STATE block appended to session instructions.
+
+        Always emits the mood line (even "uncharted") so the LLM is
+        prompted to write a fresh mood early. Voice line is omitted on
+        backends that don't populate VoiceProfileStore (HF, OpenAI,
+        Gemini); only Inworld feeds it.
+        """
+        mood = await self._read_latest_mood()
+        voice_summary = self._voice_profile_summary()
+
+        lines = ["--- CURRENT STATE ---"]
+        if mood is None:
+            lines.append(
+                "Your mood right now: uncharted "
+                "(you haven't reflected on a mood yet — "
+                "consider writing one with reflect(kind='mood_snapshot'))"
+            )
+        else:
+            minutes = round(mood["age_seconds"] / 60.0)
+            stale = " — possibly stale" if mood["age_seconds"] > 3 * 3600 else ""
+            lines.append(
+                f"Your mood right now: {mood['content']} "
+                f"(written ~{minutes} min ago{stale})"
+            )
+        if voice_summary is not None:
+            lines.append(f"User's voice right now: {voice_summary}")
+        block = "\n".join(lines)
+        logger.info("State block: %s", block.replace("\n", " | "))
+        return block
+
+    async def _resolve_full_instructions(self) -> str:
+        """Base instructions plus the dynamic state block."""
+        base = self._get_session_instructions()
+        block = await self._build_state_block()
+        if not block:
+            return base
+        return f"{base}\n\n{block}"
+
+    async def refresh_session_instructions(self) -> None:
+        """Re-issue session.update with freshly built instructions.
+
+        Called by tools (e.g. reflect on mood_snapshot) when state the
+        state block reads has changed. No-op when no live connection.
+        """
+        if self.connection is None:
+            return
+        try:
+            text = await self._resolve_full_instructions()
+            voice = self.get_current_voice()
+            await self.connection.session.update(
+                session=RealtimeSessionCreateRequestParam(
+                    type="realtime",
+                    instructions=text,
+                    audio=RealtimeAudioConfigParam(
+                        output=RealtimeAudioConfigOutputParam(voice=voice),
+                    ),
+                ),
+            )
+            logger.info("Refreshed session instructions (state block updated)")
+        except Exception:
+            logger.exception("refresh_session_instructions failed")
 
     @abstractmethod
     def _get_session_voice(self, default: str | None = None) -> str:
@@ -372,7 +475,7 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             )
 
             try:
-                instructions = self._get_session_instructions()
+                instructions = await self._resolve_full_instructions()
                 voice = self.get_current_voice()
             except BaseException as e:  # catch SystemExit from prompt loader without crashing
                 logger.error("Failed to resolve personality content: %s", e)
@@ -748,6 +851,18 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         async with self.client.realtime.connect(**connect_kwargs) as conn:
             try:
                 session_config = self._get_session_config(tool_specs)
+                # Append dynamic state block (mood + user voice) to the
+                # backend's resolved instructions before sending.
+                state_block = await self._build_state_block()
+                if state_block:
+                    base = getattr(session_config, "instructions", None) or ""
+                    try:
+                        session_config.instructions = f"{base}\n\n{state_block}"
+                    except Exception:
+                        logger.warning(
+                            "Could not append state block to session_config; "
+                            "instructions field is non-writable on this backend"
+                        )
                 await conn.session.update(session=session_config)
                 logger.info(
                     "Realtime session initialized with profile=%r voice=%r",
