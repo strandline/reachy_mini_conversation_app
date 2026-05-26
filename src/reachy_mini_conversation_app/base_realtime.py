@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+_IDLE_THRESHOLD_SECONDS: Final[float] = 60.0
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -1066,7 +1067,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
 
         # Handle idle
         idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
-        if idle_duration > 180.0 and self._response_done_event.is_set() and self.deps.movement_manager.is_idle():
+        if (
+            idle_duration > _IDLE_THRESHOLD_SECONDS
+            and self._response_done_event.is_set()
+            and self.deps.movement_manager.is_idle()
+        ):
             try:
                 await self.send_idle_signal(idle_duration)
             except Exception as e:
@@ -1126,10 +1131,21 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         """Build the realtime SDK client for this backend."""
 
     async def send_idle_signal(self, idle_duration: float) -> None:
-        """Send an idle signal to the realtime server."""
+        """Send an idle signal to the realtime server.
+
+        Injects a synthetic user message marking the silence and lets the
+        LLM pick freely (speech, tool, both, or nothing). The session-level
+        instructions in the active profile own the actual behavior policy
+        — see Bemo's "IDLE TIME" paragraph.
+        """
         logger.debug("Sending idle signal")
-        self.is_idle_tool_call = True
-        timestamp_msg = f"[Idle time update: {self.format_timestamp()} - No activity for {idle_duration:.1f}s] You've been idle for a while. Feel free to get creative - dance, show an emotion, look around, call idle_do_nothing to stay still and silent, or just be yourself!"
+        timestamp_msg = (
+            f"[Idle time update: {self.format_timestamp()} - "
+            f"{idle_duration:.1f}s since last activity] "
+            "The room's gone quiet. Take a moment — volunteer a thought, "
+            "recall something you'd want to bring up, do a small action, "
+            "or stay still."
+        )
         if not self.connection:
             logger.debug("No connection, cannot send idle signal")
             return
@@ -1140,9 +1156,4 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 "content": [{"type": "input_text", "text": timestamp_msg}],
             },
         )
-        await self._safe_response_create(
-            response=RealtimeResponseCreateParamsParam(
-                instructions="You MUST respond with function calls only - no speech or text. Choose appropriate actions for idle behavior. Use idle_do_nothing only if you intentionally want no movement or sound during this idle turn.",
-                tool_choice="required",
-            ),
-        )
+        await self._safe_response_create()
