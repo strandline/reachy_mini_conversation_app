@@ -565,6 +565,24 @@ class LocalStream:
         time.sleep(1)  # give some time to the pipelines to start
         apply_audio_startup_config(self._robot, logger=logger)
 
+        # Wireless WebRTC mode: the SDK's audio appsink ships with
+        # max-buffers=500 (≈5s of Opus@10ms-frames headroom). With drop=true
+        # that doesn't cause loss, but the pull side accumulates latency up
+        # to that cap whenever it momentarily falls behind, so realtime STT
+        # feels "queued" — symptom matches Inworld's break-in lagging behind
+        # what the user actually said. webrtcbin's rtpjitterbuffer already
+        # absorbs network jitter upstream, so the appsink only needs to
+        # smooth pull-rate variability in record_loop (~sub-ms with
+        # asyncio.sleep(0)). Drop the cap so latency stays bounded.
+        try:
+            audio = getattr(self._robot.media, "audio", None)
+            appsink = getattr(audio, "_appsink_audio", None) if audio is not None else None
+            if appsink is not None and hasattr(appsink, "set_property"):
+                appsink.set_property("max-buffers", 3)
+                logger.info("Patched WebRTC audio appsink max-buffers: 500 → 3 (reduce queued-audio latency)")
+        except Exception as exc:
+            logger.warning("Could not patch WebRTC appsink max-buffers: %s", exc)
+
         async def runner() -> None:
             # Capture loop for cross-thread personality actions
             loop = asyncio.get_running_loop()
