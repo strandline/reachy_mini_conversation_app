@@ -48,6 +48,32 @@ _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 _IDLE_THRESHOLD_SECONDS: Final[float] = 60.0
 
 
+def _resolve_scene_cooldown_seconds() -> float:
+    """Read REACHY_MINI_SCENE_COOLDOWN_SECONDS or default to 180s (3 min)."""
+    import os
+    raw = os.environ.get("REACHY_MINI_SCENE_COOLDOWN_SECONDS")
+    if raw is None:
+        return 180.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid REACHY_MINI_SCENE_COOLDOWN_SECONDS=%r; using default 180s",
+            raw,
+        )
+        return 180.0
+
+
+_SCENE_COOLDOWN_SECONDS: Final[float] = _resolve_scene_cooldown_seconds()
+_SCENE_STALE_SECONDS: Final[float] = 600.0  # 10 minutes
+_SCENE_NOTABLE_PROMPT: Final[str] = (
+    "Briefly, in one sentence: what's notable, new, or visually "
+    "interesting in this scene? Mention objects, people, clothing, "
+    "lighting, or anything that stands out. If it's just a typical "
+    "empty room with nothing remarkable, reply exactly: nothing notable."
+)
+
+
 class InputTranscriptChunksByItem(BaseModel):
     """Current item_id and its accumulated deltas. Only one item at a time."""
 
@@ -169,6 +195,15 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         self._turn_response_created_at: float | None = None
         self._turn_first_audio_at: float | None = None
 
+        # Embodied vision (branch #5): caches the most recent SmolVLM2
+        # observation of the room. Value is (text, monotonic_timestamp)
+        # when a notable observation is current, or None when the last
+        # scan returned "nothing notable" (or no scan has run yet). The
+        # state block reads this; idle/startup triggers refresh it.
+        self._latest_scene_observation: tuple[str, float] | None = None
+        self._last_scene_scan_at: float | None = None
+        self._scene_scan_lock = asyncio.Lock()
+
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
         """Remove bulky transport-only fields before echoing tool output back to the model."""
@@ -287,9 +322,92 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             )
         if voice_summary is not None:
             lines.append(f"User's voice right now: {voice_summary}")
+        scene_summary = self._scene_observation_summary()
+        if scene_summary is not None:
+            lines.append(f"What you can see right now: {scene_summary}")
         block = "\n".join(lines)
         logger.info("State block: %s", block.replace("\n", " | "))
         return block
+
+    def _scene_observation_summary(self) -> str | None:
+        """Return the cached scene observation if fresh and non-empty.
+
+        Suppresses stale observations (>10 min) and the "nothing
+        notable" case (cached as None) so the state block stays
+        honest about whether Bemo currently sees anything worth
+        mentioning.
+        """
+        cached = self._latest_scene_observation
+        if cached is None:
+            return None
+        text, ts = cached
+        if asyncio.get_event_loop().time() - ts > _SCENE_STALE_SECONDS:
+            return None
+        return text
+
+    async def _run_scene_observation(self, *, force: bool = False) -> None:
+        """Run a SmolVLM2 scan of the current camera frame.
+
+        Bails out silently when:
+          - no camera_worker / no vision_processor (non-vision sessions)
+          - cooldown not elapsed (unless force=True)
+          - no frame available
+          - already scanning (concurrent guard)
+
+        On success, caches the result and triggers a session.update
+        refresh so the new observation reaches the LLM right away.
+        Stores None when the model returns "nothing notable" — the
+        state block then omits the scene line entirely.
+        """
+        if self.deps.camera_worker is None or self.deps.vision_processor is None:
+            return
+        if self._scene_scan_lock.locked():
+            return
+        now = asyncio.get_event_loop().time()
+        if (
+            not force
+            and self._last_scene_scan_at is not None
+            and now - self._last_scene_scan_at < _SCENE_COOLDOWN_SECONDS
+        ):
+            return
+
+        async with self._scene_scan_lock:
+            frame = self.deps.camera_worker.get_latest_frame()
+            if frame is None:
+                logger.debug("Scene observation skipped: no frame available")
+                return
+            self._last_scene_scan_at = asyncio.get_event_loop().time()
+            try:
+                result = await asyncio.to_thread(
+                    self.deps.vision_processor.process_image,
+                    frame,
+                    _SCENE_NOTABLE_PROMPT,
+                )
+            except Exception:
+                logger.exception("Scene observation failed")
+                return
+
+            text = (result or "").strip()
+            normalized = text.lower().rstrip(".!?,;: ")
+            if not text or normalized == "nothing notable":
+                self._latest_scene_observation = None
+                logger.info("Scene observation: (nothing notable)")
+            else:
+                self._latest_scene_observation = (
+                    text,
+                    asyncio.get_event_loop().time(),
+                )
+                logger.info("Scene observation: %s", text)
+
+        # Refresh the session so the new state-block line is visible
+        # immediately. Refresh is a no-op when no connection is live.
+        try:
+            await self.refresh_session_instructions()
+        except Exception:
+            logger.exception(
+                "session refresh after scene observation failed; "
+                "next natural session.update will pick it up"
+            )
 
     async def _resolve_full_instructions(self) -> str:
         """Base instructions plus the dynamic state block."""
@@ -876,6 +994,22 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
 
             logger.info("Realtime session updated successfully")
 
+            # Fire-and-forget a scene observation shortly after the
+            # session opens so Bemo's first response can reference what
+            # she sees. Delay keeps SmolVLM2 inference off the critical
+            # startup path; the eventual refresh_session_instructions()
+            # injects the result when ready.
+            async def _startup_scene_scan() -> None:
+                try:
+                    await asyncio.sleep(2.0)
+                    await self._run_scene_observation()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Startup scene scan failed")
+
+            asyncio.create_task(_startup_scene_scan())
+
             # Reset the partial-transcript accumulator for each new session
             self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
 
@@ -1263,6 +1397,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         response triggered by this signal.
         """
         logger.debug("Sending idle signal")
+        # Embodied vision: try a scene scan before sending the idle
+        # signal so Bemo's idle reply can include what she sees. The
+        # cooldown gate inside the helper keeps this from running on
+        # every idle cycle.
+        await self._run_scene_observation()
         self.is_idle_tool_call = True
         timestamp_msg = (
             f"[Idle time update: {self.format_timestamp()} - "
