@@ -1,11 +1,15 @@
 import json
+import os
+import sys
 import time
 import uuid
 import base64
 import random
 import asyncio
 import logging
+import subprocess
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Final, Tuple, ClassVar, Optional
 from datetime import datetime
 
@@ -45,6 +49,74 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+_IDLE_THRESHOLD_SECONDS: Final[float] = 60.0
+
+
+def _load_capture_store() -> Any:
+    """Locate and import bemo-reachy's _capture_store, or return None.
+
+    Branch #6 Phase 1: conversational memory capture lives in the
+    workspace's tools/ dir (pointed to by REACHY_MINI_EXTERNAL_TOOLS_
+    DIRECTORY). The conv app stays usable without it — capture hooks
+    no-op when this returns None.
+    """
+    tools_dir = os.environ.get("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
+    if not tools_dir:
+        return None
+    tools_dir = os.path.abspath(os.path.expanduser(tools_dir))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import _capture_store  # type: ignore[import-not-found]
+        return _capture_store
+    except ImportError:
+        return None
+
+
+_CAPTURE_STORE = _load_capture_store()
+
+
+def _resolve_enrich_bin() -> Optional[Path]:
+    """Path to scripts/bemo-enrich derived from the external tools dir.
+
+    Convention: tools dir is <workspace>/tools, enricher script is
+    <workspace>/scripts/bemo-enrich. Returns None if either piece is
+    missing.
+    """
+    tools_dir = os.environ.get("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
+    if not tools_dir:
+        return None
+    enrich = Path(os.path.expanduser(tools_dir)).resolve().parent / "scripts" / "bemo-enrich"
+    return enrich if enrich.exists() else None
+
+
+_BEMO_ENRICH_BIN = _resolve_enrich_bin()
+
+
+def _resolve_scene_cooldown_seconds() -> float:
+    """Read REACHY_MINI_SCENE_COOLDOWN_SECONDS or default to 180s (3 min)."""
+    import os
+    raw = os.environ.get("REACHY_MINI_SCENE_COOLDOWN_SECONDS")
+    if raw is None:
+        return 180.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid REACHY_MINI_SCENE_COOLDOWN_SECONDS=%r; using default 180s",
+            raw,
+        )
+        return 180.0
+
+
+_SCENE_COOLDOWN_SECONDS: Final[float] = _resolve_scene_cooldown_seconds()
+_SCENE_STALE_SECONDS: Final[float] = 600.0  # 10 minutes
+_SCENE_NOTABLE_PROMPT: Final[str] = (
+    "Briefly, in one sentence: what's notable, new, or visually "
+    "interesting in this scene? Mention objects, people, clothing, "
+    "lighting, or anything that stands out. If it's just a typical "
+    "empty room with nothing remarkable, reply exactly: nothing notable."
+)
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -123,6 +195,9 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         )
 
         self.deps = deps
+        # Let external tools request a fresh session.update when state the
+        # state-block reads changes (e.g. mood_snapshot writes).
+        self.deps.refresh_session_instructions = self.refresh_session_instructions
 
         self.output_sample_rate = sample_rate
         self.input_sample_rate = sample_rate
@@ -164,6 +239,15 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
         self._turn_first_audio_at: float | None = None
+
+        # Embodied vision (branch #5): caches the most recent SmolVLM2
+        # observation of the room. Value is (text, monotonic_timestamp)
+        # when a notable observation is current, or None when the last
+        # scan returned "nothing notable" (or no scan has run yet). The
+        # state block reads this; idle/startup triggers refresh it.
+        self._latest_scene_observation: tuple[str, float] | None = None
+        self._last_scene_scan_at: float | None = None
+        self._scene_scan_lock = asyncio.Lock()
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -218,6 +302,233 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
     @abstractmethod
     def _get_session_instructions(self) -> str:
         """Return session instructions for this backend."""
+
+    async def _read_latest_mood(self) -> dict[str, Any] | None:
+        """Best-effort read of Bemo's latest mood snapshot.
+
+        Returns None unless the external tools dir has _memory_store.py
+        loaded (its `latest_mood_snapshot()` is the contract). Soft
+        dependency: the conv app stays usable without external memory.
+        """
+        try:
+            import _memory_store  # type: ignore[import-not-found]
+        except ImportError:
+            return None
+        try:
+            return await _memory_store.latest_mood_snapshot()
+        except Exception:
+            logger.exception("latest_mood_snapshot failed")
+            return None
+
+    def _voice_profile_summary(self) -> str | None:
+        """Format the most recent user VoiceProfile as a one-line summary."""
+        store = self.deps.voice_profile_store
+        if store is None:
+            return None
+        profile = store.get_current()
+        if profile is None:
+            return None
+        bits: list[str] = []
+        emotion = profile.top_emotion()
+        if emotion:
+            bits.append(emotion)
+        pitch = profile.top_pitch()
+        if pitch:
+            bits.append(f"{pitch} pitch")
+        style = profile.top_vocal_style()
+        if style:
+            bits.append(style)
+        return ", ".join(bits) if bits else None
+
+    async def _build_state_block(self) -> str:
+        """Return the CURRENT STATE block appended to session instructions.
+
+        Always emits the mood line (even "uncharted") so the LLM is
+        prompted to write a fresh mood early. Voice line is omitted on
+        backends that don't populate VoiceProfileStore (HF, OpenAI,
+        Gemini); only Inworld feeds it.
+
+        Branch #6 Phase 1: also emits a directive line, a "Recently:"
+        recap from the prior episode summary, and a "Phrases you've
+        leaned on" line when Bemo has been overusing anything across
+        sessions. The directive tells her these signals override the
+        personality file's topical priming — without it, the personality
+        file keeps cueing the same openings.
+        """
+        mood = await self._read_latest_mood()
+        voice_summary = self._voice_profile_summary()
+
+        lines = ["--- CURRENT STATE ---"]
+        # Phase 1 directive: state block overrides personality-file priming.
+        lines.append(
+            "Treat this block as authoritative for this session's opening. "
+            "If a 'Recently:' line names a topic you and the person were "
+            "just discussing, pick up there — do NOT fall back to the "
+            "stock topical suggestions in your personality file."
+        )
+        if mood is None:
+            lines.append(
+                "Your mood right now: uncharted "
+                "(you haven't reflected on a mood yet — "
+                "consider writing one with reflect(kind='mood_snapshot'))"
+            )
+        else:
+            minutes = round(mood["age_seconds"] / 60.0)
+            stale = " — possibly stale" if mood["age_seconds"] > 3 * 3600 else ""
+            lines.append(
+                f"Your mood right now: {mood['content']} "
+                f"(written ~{minutes} min ago{stale})"
+            )
+        if voice_summary is not None:
+            lines.append(f"User's voice right now: {voice_summary}")
+        scene_summary = self._scene_observation_summary()
+        if scene_summary is not None:
+            lines.append(f"What you can see right now: {scene_summary}")
+
+        # Phase 1: prior-episode recap + cross-session anti-pattern hint.
+        if _CAPTURE_STORE is not None:
+            try:
+                recent = await asyncio.to_thread(
+                    _CAPTURE_STORE.recent_episode_summaries, 1
+                )
+                if recent:
+                    summary = (recent[0].get("summary") or "").strip()
+                    vibe = (recent[0].get("vibe") or "").strip()
+                    if summary:
+                        vibe_tail = f" (vibe: {vibe})" if vibe else ""
+                        lines.append(f"Recently: {summary}{vibe_tail}")
+            except Exception:
+                logger.exception("recent_episode_summaries failed")
+            try:
+                patterns = await asyncio.to_thread(
+                    _CAPTURE_STORE.recent_patterns, min_count=5, days=7
+                )
+                if patterns:
+                    top = patterns[:3]
+                    rendered = " · ".join(
+                        f'"{p["pattern"]}" ({p["count"]}×)' for p in top
+                    )
+                    lines.append(
+                        f"Phrases you've leaned on lately: {rendered} — vary them."
+                    )
+            except Exception:
+                logger.exception("recent_patterns failed")
+
+        block = "\n".join(lines)
+        logger.info("State block: %s", block.replace("\n", " | "))
+        return block
+
+    def _scene_observation_summary(self) -> str | None:
+        """Return the cached scene observation if fresh and non-empty.
+
+        Suppresses stale observations (>10 min) and the "nothing
+        notable" case (cached as None) so the state block stays
+        honest about whether Bemo currently sees anything worth
+        mentioning.
+        """
+        cached = self._latest_scene_observation
+        if cached is None:
+            return None
+        text, ts = cached
+        if asyncio.get_event_loop().time() - ts > _SCENE_STALE_SECONDS:
+            return None
+        return text
+
+    async def _run_scene_observation(self, *, force: bool = False) -> None:
+        """Run a SmolVLM2 scan of the current camera frame.
+
+        Bails out silently when:
+          - no camera_worker / no vision_processor (non-vision sessions)
+          - cooldown not elapsed (unless force=True)
+          - no frame available
+          - already scanning (concurrent guard)
+
+        On success, caches the result and triggers a session.update
+        refresh so the new observation reaches the LLM right away.
+        Stores None when the model returns "nothing notable" — the
+        state block then omits the scene line entirely.
+        """
+        if self.deps.camera_worker is None or self.deps.vision_processor is None:
+            return
+        if self._scene_scan_lock.locked():
+            return
+        now = asyncio.get_event_loop().time()
+        if (
+            not force
+            and self._last_scene_scan_at is not None
+            and now - self._last_scene_scan_at < _SCENE_COOLDOWN_SECONDS
+        ):
+            return
+
+        async with self._scene_scan_lock:
+            frame = self.deps.camera_worker.get_latest_frame()
+            if frame is None:
+                logger.debug("Scene observation skipped: no frame available")
+                return
+            self._last_scene_scan_at = asyncio.get_event_loop().time()
+            try:
+                result = await asyncio.to_thread(
+                    self.deps.vision_processor.process_image,
+                    frame,
+                    _SCENE_NOTABLE_PROMPT,
+                )
+            except Exception:
+                logger.exception("Scene observation failed")
+                return
+
+            text = (result or "").strip()
+            normalized = text.lower().rstrip(".!?,;: ")
+            if not text or normalized == "nothing notable":
+                self._latest_scene_observation = None
+                logger.info("Scene observation: (nothing notable)")
+            else:
+                self._latest_scene_observation = (
+                    text,
+                    asyncio.get_event_loop().time(),
+                )
+                logger.info("Scene observation: %s", text)
+
+        # Refresh the session so the new state-block line is visible
+        # immediately. Refresh is a no-op when no connection is live.
+        try:
+            await self.refresh_session_instructions()
+        except Exception:
+            logger.exception(
+                "session refresh after scene observation failed; "
+                "next natural session.update will pick it up"
+            )
+
+    async def _resolve_full_instructions(self) -> str:
+        """Base instructions plus the dynamic state block."""
+        base = self._get_session_instructions()
+        block = await self._build_state_block()
+        if not block:
+            return base
+        return f"{base}\n\n{block}"
+
+    async def refresh_session_instructions(self) -> None:
+        """Re-issue session.update with freshly built instructions.
+
+        Called by tools (e.g. reflect on mood_snapshot) when state the
+        state block reads has changed. No-op when no live connection.
+        """
+        if self.connection is None:
+            return
+        try:
+            text = await self._resolve_full_instructions()
+            voice = self.get_current_voice()
+            await self.connection.session.update(
+                session=RealtimeSessionCreateRequestParam(
+                    type="realtime",
+                    instructions=text,
+                    audio=RealtimeAudioConfigParam(
+                        output=RealtimeAudioConfigOutputParam(voice=voice),
+                    ),
+                ),
+            )
+            logger.info("Refreshed session instructions (state block updated)")
+        except Exception:
+            logger.exception("refresh_session_instructions failed")
 
     @abstractmethod
     def _get_session_voice(self, default: str | None = None) -> str:
@@ -371,7 +682,7 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             )
 
             try:
-                instructions = self._get_session_instructions()
+                instructions = await self._resolve_full_instructions()
                 voice = self.get_current_voice()
             except BaseException as e:  # catch SystemExit from prompt loader without crashing
                 logger.error("Failed to resolve personality content: %s", e)
@@ -747,6 +1058,18 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         async with self.client.realtime.connect(**connect_kwargs) as conn:
             try:
                 session_config = self._get_session_config(tool_specs)
+                # Append dynamic state block (mood + user voice) to the
+                # backend's resolved instructions before sending.
+                state_block = await self._build_state_block()
+                if state_block:
+                    base = getattr(session_config, "instructions", None) or ""
+                    try:
+                        session_config.instructions = f"{base}\n\n{state_block}"
+                    except Exception:
+                        logger.warning(
+                            "Could not append state block to session_config; "
+                            "instructions field is non-writable on this backend"
+                        )
                 await conn.session.update(session=session_config)
                 logger.info(
                     "Realtime session initialized with profile=%r voice=%r",
@@ -754,11 +1077,37 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                     self.get_current_voice(),
                 )
                 self._persist_credentials_if_needed()
+                # Branch #6 Phase 1: open a capture episode. No-op when
+                # _capture_store isn't loaded (workspace tools/ dir not
+                # set or import failed). Stored as instance attribute so
+                # transcript event handlers below can append turns to it.
+                self._capture_episode_id = None
+                if _CAPTURE_STORE is not None:
+                    try:
+                        self._capture_episode_id = await _CAPTURE_STORE.open_episode([])
+                    except Exception:
+                        logger.exception("open_episode failed; capture disabled this session")
             except Exception:
                 logger.exception("Realtime session.update failed; aborting startup")
                 raise
 
             logger.info("Realtime session updated successfully")
+
+            # Fire-and-forget a scene observation shortly after the
+            # session opens so Bemo's first response can reference what
+            # she sees. Delay keeps SmolVLM2 inference off the critical
+            # startup path; the eventual refresh_session_instructions()
+            # injects the result when ready.
+            async def _startup_scene_scan() -> None:
+                try:
+                    await asyncio.sleep(2.0)
+                    await self._run_scene_observation()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Startup scene scan failed")
+
+            asyncio.create_task(_startup_scene_scan())
 
             # Reset the partial-transcript accumulator for each new session
             self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
@@ -892,6 +1241,19 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
 
+                        # Branch #6 Phase 1: capture user turn synchronously
+                        # to disk. SIGKILL-safe (no buffering).
+                        if _CAPTURE_STORE is not None and self._capture_episode_id is not None:
+                            try:
+                                await _CAPTURE_STORE.append_turn(
+                                    self._capture_episode_id,
+                                    "user",
+                                    transcript,
+                                    getattr(event, "item_id", None),
+                                )
+                            except Exception:
+                                logger.exception("append_turn (user) failed")
+
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
                         self._mark_activity("assistant_transcript_done")
@@ -899,6 +1261,18 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         await self.output_queue.put(
                             AdditionalOutputs({"role": "assistant", "content": event.transcript})
                         )
+
+                        # Branch #6 Phase 1: capture assistant turn.
+                        if _CAPTURE_STORE is not None and self._capture_episode_id is not None:
+                            try:
+                                await _CAPTURE_STORE.append_turn(
+                                    self._capture_episode_id,
+                                    "assistant",
+                                    event.transcript or "",
+                                    getattr(event, "item_id", None),
+                                )
+                            except Exception:
+                                logger.exception("append_turn (assistant) failed")
 
                     # Handle audio delta
                     if event.type == "response.output_audio.delta":
@@ -1018,6 +1392,53 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 # Stop background tool manager tasks (listener + cleanup) in all paths.
                 await self.tool_manager.shutdown()
 
+                # Branch #6 Phase 1: close the capture episode and
+                # spawn the enricher detached so SIGKILL/teardown of
+                # the conv-app doesn't kill it. Uses close_episode_sync
+                # rather than `await close_episode` because by the time
+                # the asyncio finally runs, the loop is being canceled
+                # and any awaitable racing with teardown loses (verified
+                # 2026-05-27 — ended_at stayed NULL despite the await).
+                # SQLite writes are <5ms, so the sync block is cheap.
+                if _CAPTURE_STORE is not None and self._capture_episode_id is not None:
+                    eid = self._capture_episode_id
+                    self._capture_episode_id = None
+                    try:
+                        _CAPTURE_STORE.close_episode_sync(eid)
+                    except Exception:
+                        logger.exception("close_episode_sync failed for episode %d", eid)
+                    if _BEMO_ENRICH_BIN is not None:
+                        # Redirect stdio to a per-episode log instead of
+                        # DEVNULL. Prior silent failures (the spawned
+                        # child ran but wrote nothing to the DB) were
+                        # un-diagnosable with DEVNULL. -v gives DEBUG
+                        # output so any future spawn-side errors are
+                        # captured. The conv-app closes its dup of the
+                        # log fd; the child keeps fd 1/2 pointed at it.
+                        try:
+                            log_dir = Path("/tmp/bemo-reachy-logs")
+                            log_dir.mkdir(parents=True, exist_ok=True)
+                            log_path = log_dir / f"enrich-{eid}.log"
+                            with open(log_path, "ab") as log_fp:
+                                subprocess.Popen(
+                                    [sys.executable, str(_BEMO_ENRICH_BIN),
+                                     "--episode", str(eid), "-v"],
+                                    stdout=log_fp,
+                                    stderr=subprocess.STDOUT,
+                                    start_new_session=True,
+                                    close_fds=True,
+                                )
+                            logger.info(
+                                "Spawned bemo-enrich for episode %d (log: %s)",
+                                eid, log_path,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to spawn bemo-enrich for episode %d "
+                                "(cron --unprocessed will catch it later)",
+                                eid,
+                            )
+
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         """Receive audio frame from the microphone and send it to the realtime server.
@@ -1066,7 +1487,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
 
         # Handle idle
         idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
-        if idle_duration > 180.0 and self._response_done_event.is_set() and self.deps.movement_manager.is_idle():
+        if (
+            idle_duration > _IDLE_THRESHOLD_SECONDS
+            and self._response_done_event.is_set()
+            and self.deps.movement_manager.is_idle()
+        ):
             try:
                 await self.send_idle_signal(idle_duration)
             except Exception as e:
@@ -1126,10 +1551,36 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         """Build the realtime SDK client for this backend."""
 
     async def send_idle_signal(self, idle_duration: float) -> None:
-        """Send an idle signal to the realtime server."""
+        """Send an idle signal to the realtime server.
+
+        Injects a synthetic user message marking the silence and lets the
+        LLM pick freely (speech, tool, both, or nothing). The session-level
+        instructions in the active profile own the actual behavior policy
+        — see Bemo's "IDLE TIME" paragraph.
+
+        Sets ``is_idle_tool_call`` so any tool calls made in response to
+        the idle signal don't each trigger a follow-up ``response.create``
+        in ``_handle_tool_result``. Without that guard, every tool result
+        prompts a new "use the tool result and answer concisely in speech"
+        response — which cascades into runaway chatter when the LLM has
+        nothing meaningful to add but is told to speak anyway. With the
+        guard, all idle output (speech + tools) is contained in the single
+        response triggered by this signal.
+        """
         logger.debug("Sending idle signal")
+        # Embodied vision: try a scene scan before sending the idle
+        # signal so Bemo's idle reply can include what she sees. The
+        # cooldown gate inside the helper keeps this from running on
+        # every idle cycle.
+        await self._run_scene_observation()
         self.is_idle_tool_call = True
-        timestamp_msg = f"[Idle time update: {self.format_timestamp()} - No activity for {idle_duration:.1f}s] You've been idle for a while. Feel free to get creative - dance, show an emotion, look around, call idle_do_nothing to stay still and silent, or just be yourself!"
+        timestamp_msg = (
+            f"[Idle time update: {self.format_timestamp()} - "
+            f"{idle_duration:.1f}s since last activity] "
+            "The room's gone quiet. Take a moment — volunteer a thought, "
+            "recall something you'd want to bring up, do a small action, "
+            "or stay still."
+        )
         if not self.connection:
             logger.debug("No connection, cannot send idle signal")
             return
@@ -1140,9 +1591,4 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 "content": [{"type": "input_text", "text": timestamp_msg}],
             },
         )
-        await self._safe_response_create(
-            response=RealtimeResponseCreateParamsParam(
-                instructions="You MUST respond with function calls only - no speech or text. Choose appropriate actions for idle behavior. Use idle_do_nothing only if you intentionally want no movement or sound during this idle turn.",
-                tool_choice="required",
-            ),
-        )
+        await self._safe_response_create()

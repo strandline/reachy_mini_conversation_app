@@ -26,6 +26,7 @@ from reachy_mini.media.media_manager import MediaBackend
 from reachy_mini_conversation_app.config import (
     HF_BACKEND,
     GEMINI_BACKEND,
+    INWORLD_BACKEND,
     LOCKED_PROFILE,
     OPENAI_BACKEND,
     HF_REALTIME_WS_URL_ENV,
@@ -175,6 +176,8 @@ class LocalStream:
             return self._has_key(config.GEMINI_API_KEY)
         if backend == HF_BACKEND:
             return has_hf_realtime_target()
+        if backend == INWORLD_BACKEND:
+            return self._has_key(config.INWORLD_API_KEY)
         return self._has_key(config.OPENAI_API_KEY)
 
     @staticmethod
@@ -184,6 +187,8 @@ class LocalStream:
             return "GEMINI_API_KEY"
         if backend == HF_BACKEND:
             return HF_REALTIME_WS_URL_ENV
+        if backend == INWORLD_BACKEND:
+            return "INWORLD_API_KEY"
         return "OPENAI_API_KEY"
 
     def _persist_env_value(self, env_name: str, value: str) -> None:
@@ -282,6 +287,10 @@ class LocalStream:
     def _persist_gemini_api_key(self, key: str) -> None:
         """Persist GEMINI_API_KEY to environment and instance `.env`."""
         self._persist_env_value("GEMINI_API_KEY", key)
+
+    def _persist_inworld_api_key(self, key: str) -> None:
+        """Persist INWORLD_API_KEY to environment and instance `.env`."""
+        self._persist_env_value("INWORLD_API_KEY", key)
 
     def _persist_backend_choice(self, backend: str) -> None:
         """Persist the selected backend without clobbering explicit model overrides."""
@@ -439,17 +448,21 @@ class LocalStream:
         @self._settings_app.post("/backend_config")
         def _set_backend(payload: BackendPayload) -> JSONResponse:
             backend = payload.backend.strip().lower()
-            if backend not in {OPENAI_BACKEND, GEMINI_BACKEND, HF_BACKEND}:
+            if backend not in {OPENAI_BACKEND, GEMINI_BACKEND, HF_BACKEND, INWORLD_BACKEND}:
                 return JSONResponse({"ok": False, "error": "invalid_backend"}, status_code=400)
 
             api_key = (payload.api_key or "").strip()
             if backend == GEMINI_BACKEND and not api_key and not self._has_required_key(GEMINI_BACKEND):
+                return JSONResponse({"ok": False, "error": "empty_key"}, status_code=400)
+            if backend == INWORLD_BACKEND and not api_key and not self._has_required_key(INWORLD_BACKEND):
                 return JSONResponse({"ok": False, "error": "empty_key"}, status_code=400)
 
             if backend == OPENAI_BACKEND and api_key:
                 self._persist_api_key(api_key)
             if backend == GEMINI_BACKEND and api_key:
                 self._persist_gemini_api_key(api_key)
+            if backend == INWORLD_BACKEND and api_key:
+                self._persist_inworld_api_key(api_key)
             if backend == HF_BACKEND:
                 hf_selection = get_hf_connection_selection()
                 hf_mode = (payload.hf_mode or hf_selection.mode).strip().lower()
@@ -564,6 +577,24 @@ class LocalStream:
         self._robot.media.start_playing()
         time.sleep(1)  # give some time to the pipelines to start
         apply_audio_startup_config(self._robot, logger=logger)
+
+        # Wireless WebRTC mode: the SDK's audio appsink ships with
+        # max-buffers=500 (≈5s of Opus@10ms-frames headroom). With drop=true
+        # that doesn't cause loss, but the pull side accumulates latency up
+        # to that cap whenever it momentarily falls behind, so realtime STT
+        # feels "queued" — symptom matches Inworld's break-in lagging behind
+        # what the user actually said. webrtcbin's rtpjitterbuffer already
+        # absorbs network jitter upstream, so the appsink only needs to
+        # smooth pull-rate variability in record_loop (~sub-ms with
+        # asyncio.sleep(0)). Drop the cap so latency stays bounded.
+        try:
+            audio = getattr(self._robot.media, "audio", None)
+            appsink = getattr(audio, "_appsink_audio", None) if audio is not None else None
+            if appsink is not None and hasattr(appsink, "set_property"):
+                appsink.set_property("max-buffers", 3)
+                logger.info("Patched WebRTC audio appsink max-buffers: 500 → 3 (reduce queued-audio latency)")
+        except Exception as exc:
+            logger.warning("Could not patch WebRTC appsink max-buffers: %s", exc)
 
         async def runner() -> None:
             # Capture loop for cross-thread personality actions

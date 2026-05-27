@@ -97,8 +97,9 @@ class VoiceProfile:
 def _parse_label_array(items: Any) -> list[ClassLabel]:
     """Coerce Inworld's `[{label, confidence}, ...]` arrays into ClassLabels.
 
-    Handles both camelCase (`confidence`) and snake_case (`confidence`) keys.
-    Robust to missing fields and odd types — returns whatever it can.
+    Each entry must have a `label` (str) and `confidence` (numeric) key —
+    Inworld emits these in lowerCamelCase. Robust to missing fields and odd
+    types — returns whatever it can.
     """
     if not isinstance(items, list):
         return []
@@ -121,18 +122,29 @@ def _parse_label_array(items: Any) -> list[ClassLabel]:
 def parse_voice_profile(payload: Any) -> VoiceProfile | None:
     """Build a `VoiceProfile` from a raw Inworld `voiceProfile` payload.
 
-    Returns None if `payload` isn't a dict or has no usable fields.
+    Returns None if `payload` isn't a dict OR if every parsed label array
+    is empty (Inworld occasionally emits `voiceProfile: {}` or a dict
+    whose category arrays are all empty when it couldn't classify the
+    utterance — callers' `if profile is None` guards rely on that case
+    returning None rather than an all-empty profile).
     Accepts both camelCase (`vocalStyle`) and snake_case (`vocal_style`).
     """
     if not isinstance(payload, dict):
         return None
     vocal_style_raw = payload.get("vocalStyle") or payload.get("vocal_style") or []
+    age = _parse_label_array(payload.get("age"))
+    emotion = _parse_label_array(payload.get("emotion"))
+    pitch = _parse_label_array(payload.get("pitch"))
+    vocal_style = _parse_label_array(vocal_style_raw)
+    accent = _parse_label_array(payload.get("accent"))
+    if not (age or emotion or pitch or vocal_style or accent):
+        return None
     return VoiceProfile(
-        age=_parse_label_array(payload.get("age")),
-        emotion=_parse_label_array(payload.get("emotion")),
-        pitch=_parse_label_array(payload.get("pitch")),
-        vocal_style=_parse_label_array(vocal_style_raw),
-        accent=_parse_label_array(payload.get("accent")),
+        age=age,
+        emotion=emotion,
+        pitch=pitch,
+        vocal_style=vocal_style,
+        accent=accent,
         raw=payload,
         received_monotonic=time.monotonic(),
     )

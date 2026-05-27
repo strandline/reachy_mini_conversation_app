@@ -12,7 +12,7 @@ from openai.resources.realtime.realtime import (
     AsyncRealtimeConnectionManager,
 )
 
-from reachy_mini_conversation_app.config import INWORLD_BACKEND, config
+from reachy_mini_conversation_app.config import INWORLD_BACKEND, INWORLD_DEFAULT_LLM, config
 from reachy_mini_conversation_app.prompts import get_session_voice, get_session_instructions
 from reachy_mini_conversation_app.base_realtime import BaseRealtimeHandler, to_realtime_tools_config
 from reachy_mini_conversation_app.tools.core_tools import get_active_tool_specs
@@ -25,7 +25,7 @@ __all__ = ["InworldRealtimeHandler"]
 
 INWORLD_WS_BASE = "wss://api.inworld.ai/api/v1"
 INWORLD_HTTP_BASE = "https://api.inworld.ai/api/v1"
-INWORLD_DEFAULT_LLM = "openai/gpt-4.1-mini"
+# INWORLD_DEFAULT_LLM is imported from config — single source of truth.
 INWORLD_STT_MODEL = "assemblyai/u3-rt-pro"
 INWORLD_TTS_MODEL = "inworld-tts-2"
 # 16 kHz PCM for parity with the Reachy Mini audio pipeline. Inworld's server
@@ -138,7 +138,10 @@ class InworldRealtimeHandler(BaseRealtimeHandler):
         rate = INWORLD_SAMPLE_RATE
         return {
             "type": "realtime",
-            "model": config.MODEL_NAME or INWORLD_DEFAULT_LLM,
+            # config.MODEL_NAME is resolved by _resolve_model_name to a
+            # non-empty default (INWORLD_DEFAULT_LLM) when MODEL_NAME is
+            # unset, so no fallback `or` clause is needed here.
+            "model": config.MODEL_NAME,
             "instructions": self._get_session_instructions(),
             "output_modalities": ["audio", "text"],
             "audio": {
@@ -156,7 +159,7 @@ class InworldRealtimeHandler(BaseRealtimeHandler):
                     },
                     "turn_detection": {
                         "type": "semantic_vad",
-                        "eagerness": "high",
+                        "eagerness": "medium",
                         "create_response": True,
                         "interrupt_response": True,
                     },

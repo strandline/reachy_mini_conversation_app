@@ -476,6 +476,7 @@ def refresh_runtime_config_from_env() -> None:
     """Refresh mutable runtime config fields from the current environment."""
     config.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     config.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    config.INWORLD_API_KEY = os.getenv("INWORLD_API_KEY")
     config.BACKEND_PROVIDER = _normalize_backend_provider(
         os.getenv("BACKEND_PROVIDER"),
         os.getenv("MODEL_NAME"),
