@@ -26,6 +26,7 @@ from reachy_mini.media.media_manager import MediaBackend
 from reachy_mini_conversation_app.config import (
     HF_BACKEND,
     GEMINI_BACKEND,
+    INWORLD_BACKEND,
     LOCKED_PROFILE,
     OPENAI_BACKEND,
     HF_REALTIME_WS_URL_ENV,
@@ -175,6 +176,8 @@ class LocalStream:
             return self._has_key(config.GEMINI_API_KEY)
         if backend == HF_BACKEND:
             return has_hf_realtime_target()
+        if backend == INWORLD_BACKEND:
+            return self._has_key(config.INWORLD_API_KEY)
         return self._has_key(config.OPENAI_API_KEY)
 
     @staticmethod
@@ -184,6 +187,8 @@ class LocalStream:
             return "GEMINI_API_KEY"
         if backend == HF_BACKEND:
             return HF_REALTIME_WS_URL_ENV
+        if backend == INWORLD_BACKEND:
+            return "INWORLD_API_KEY"
         return "OPENAI_API_KEY"
 
     def _persist_env_value(self, env_name: str, value: str) -> None:
@@ -282,6 +287,10 @@ class LocalStream:
     def _persist_gemini_api_key(self, key: str) -> None:
         """Persist GEMINI_API_KEY to environment and instance `.env`."""
         self._persist_env_value("GEMINI_API_KEY", key)
+
+    def _persist_inworld_api_key(self, key: str) -> None:
+        """Persist INWORLD_API_KEY to environment and instance `.env`."""
+        self._persist_env_value("INWORLD_API_KEY", key)
 
     def _persist_backend_choice(self, backend: str) -> None:
         """Persist the selected backend without clobbering explicit model overrides."""
@@ -439,17 +448,21 @@ class LocalStream:
         @self._settings_app.post("/backend_config")
         def _set_backend(payload: BackendPayload) -> JSONResponse:
             backend = payload.backend.strip().lower()
-            if backend not in {OPENAI_BACKEND, GEMINI_BACKEND, HF_BACKEND}:
+            if backend not in {OPENAI_BACKEND, GEMINI_BACKEND, HF_BACKEND, INWORLD_BACKEND}:
                 return JSONResponse({"ok": False, "error": "invalid_backend"}, status_code=400)
 
             api_key = (payload.api_key or "").strip()
             if backend == GEMINI_BACKEND and not api_key and not self._has_required_key(GEMINI_BACKEND):
+                return JSONResponse({"ok": False, "error": "empty_key"}, status_code=400)
+            if backend == INWORLD_BACKEND and not api_key and not self._has_required_key(INWORLD_BACKEND):
                 return JSONResponse({"ok": False, "error": "empty_key"}, status_code=400)
 
             if backend == OPENAI_BACKEND and api_key:
                 self._persist_api_key(api_key)
             if backend == GEMINI_BACKEND and api_key:
                 self._persist_gemini_api_key(api_key)
+            if backend == INWORLD_BACKEND and api_key:
+                self._persist_inworld_api_key(api_key)
             if backend == HF_BACKEND:
                 hf_selection = get_hf_connection_selection()
                 hf_mode = (payload.hf_mode or hf_selection.mode).strip().lower()
