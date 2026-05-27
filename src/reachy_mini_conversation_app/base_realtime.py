@@ -1,11 +1,15 @@
 import json
+import os
+import sys
 import time
 import uuid
 import base64
 import random
 import asyncio
 import logging
+import subprocess
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Final, Tuple, ClassVar, Optional
 from datetime import datetime
 
@@ -46,6 +50,47 @@ logger = logging.getLogger(__name__)
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 _IDLE_THRESHOLD_SECONDS: Final[float] = 60.0
+
+
+def _load_capture_store() -> Any:
+    """Locate and import bemo-reachy's _capture_store, or return None.
+
+    Branch #6 Phase 1: conversational memory capture lives in the
+    workspace's tools/ dir (pointed to by REACHY_MINI_EXTERNAL_TOOLS_
+    DIRECTORY). The conv app stays usable without it — capture hooks
+    no-op when this returns None.
+    """
+    tools_dir = os.environ.get("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
+    if not tools_dir:
+        return None
+    tools_dir = os.path.abspath(os.path.expanduser(tools_dir))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import _capture_store  # type: ignore[import-not-found]
+        return _capture_store
+    except ImportError:
+        return None
+
+
+_CAPTURE_STORE = _load_capture_store()
+
+
+def _resolve_enrich_bin() -> Optional[Path]:
+    """Path to scripts/bemo-enrich derived from the external tools dir.
+
+    Convention: tools dir is <workspace>/tools, enricher script is
+    <workspace>/scripts/bemo-enrich. Returns None if either piece is
+    missing.
+    """
+    tools_dir = os.environ.get("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
+    if not tools_dir:
+        return None
+    enrich = Path(os.path.expanduser(tools_dir)).resolve().parent / "scripts" / "bemo-enrich"
+    return enrich if enrich.exists() else None
+
+
+_BEMO_ENRICH_BIN = _resolve_enrich_bin()
 
 
 def _resolve_scene_cooldown_seconds() -> float:
@@ -302,11 +347,25 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         prompted to write a fresh mood early. Voice line is omitted on
         backends that don't populate VoiceProfileStore (HF, OpenAI,
         Gemini); only Inworld feeds it.
+
+        Branch #6 Phase 1: also emits a directive line, a "Recently:"
+        recap from the prior episode summary, and a "Phrases you've
+        leaned on" line when Bemo has been overusing anything across
+        sessions. The directive tells her these signals override the
+        personality file's topical priming — without it, the personality
+        file keeps cueing the same openings.
         """
         mood = await self._read_latest_mood()
         voice_summary = self._voice_profile_summary()
 
         lines = ["--- CURRENT STATE ---"]
+        # Phase 1 directive: state block overrides personality-file priming.
+        lines.append(
+            "Treat this block as authoritative for this session's opening. "
+            "If a 'Recently:' line names a topic you and the person were "
+            "just discussing, pick up there — do NOT fall back to the "
+            "stock topical suggestions in your personality file."
+        )
         if mood is None:
             lines.append(
                 "Your mood right now: uncharted "
@@ -325,6 +384,36 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         scene_summary = self._scene_observation_summary()
         if scene_summary is not None:
             lines.append(f"What you can see right now: {scene_summary}")
+
+        # Phase 1: prior-episode recap + cross-session anti-pattern hint.
+        if _CAPTURE_STORE is not None:
+            try:
+                recent = await asyncio.to_thread(
+                    _CAPTURE_STORE.recent_episode_summaries, 1
+                )
+                if recent:
+                    summary = (recent[0].get("summary") or "").strip()
+                    vibe = (recent[0].get("vibe") or "").strip()
+                    if summary:
+                        vibe_tail = f" (vibe: {vibe})" if vibe else ""
+                        lines.append(f"Recently: {summary}{vibe_tail}")
+            except Exception:
+                logger.exception("recent_episode_summaries failed")
+            try:
+                patterns = await asyncio.to_thread(
+                    _CAPTURE_STORE.recent_patterns, min_count=5, days=7
+                )
+                if patterns:
+                    top = patterns[:3]
+                    rendered = " · ".join(
+                        f'"{p["pattern"]}" ({p["count"]}×)' for p in top
+                    )
+                    lines.append(
+                        f"Phrases you've leaned on lately: {rendered} — vary them."
+                    )
+            except Exception:
+                logger.exception("recent_patterns failed")
+
         block = "\n".join(lines)
         logger.info("State block: %s", block.replace("\n", " | "))
         return block
@@ -988,6 +1077,16 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                     self.get_current_voice(),
                 )
                 self._persist_credentials_if_needed()
+                # Branch #6 Phase 1: open a capture episode. No-op when
+                # _capture_store isn't loaded (workspace tools/ dir not
+                # set or import failed). Stored as instance attribute so
+                # transcript event handlers below can append turns to it.
+                self._capture_episode_id = None
+                if _CAPTURE_STORE is not None:
+                    try:
+                        self._capture_episode_id = await _CAPTURE_STORE.open_episode([])
+                    except Exception:
+                        logger.exception("open_episode failed; capture disabled this session")
             except Exception:
                 logger.exception("Realtime session.update failed; aborting startup")
                 raise
@@ -1142,6 +1241,19 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
 
+                        # Branch #6 Phase 1: capture user turn synchronously
+                        # to disk. SIGKILL-safe (no buffering).
+                        if _CAPTURE_STORE is not None and self._capture_episode_id is not None:
+                            try:
+                                await _CAPTURE_STORE.append_turn(
+                                    self._capture_episode_id,
+                                    "user",
+                                    transcript,
+                                    getattr(event, "item_id", None),
+                                )
+                            except Exception:
+                                logger.exception("append_turn (user) failed")
+
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
                         self._mark_activity("assistant_transcript_done")
@@ -1149,6 +1261,18 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         await self.output_queue.put(
                             AdditionalOutputs({"role": "assistant", "content": event.transcript})
                         )
+
+                        # Branch #6 Phase 1: capture assistant turn.
+                        if _CAPTURE_STORE is not None and self._capture_episode_id is not None:
+                            try:
+                                await _CAPTURE_STORE.append_turn(
+                                    self._capture_episode_id,
+                                    "assistant",
+                                    event.transcript or "",
+                                    getattr(event, "item_id", None),
+                                )
+                            except Exception:
+                                logger.exception("append_turn (assistant) failed")
 
                     # Handle audio delta
                     if event.type == "response.output_audio.delta":
@@ -1267,6 +1391,36 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
 
                 # Stop background tool manager tasks (listener + cleanup) in all paths.
                 await self.tool_manager.shutdown()
+
+                # Branch #6 Phase 1: close the capture episode and
+                # spawn the enricher detached so SIGKILL of the
+                # conv-app doesn't kill it. The enricher writes a
+                # summary + vibe + anti_patterns back to the DB; the
+                # next session's _build_state_block reads them.
+                if _CAPTURE_STORE is not None and self._capture_episode_id is not None:
+                    eid = self._capture_episode_id
+                    self._capture_episode_id = None
+                    try:
+                        await _CAPTURE_STORE.close_episode(eid)
+                    except Exception:
+                        logger.exception("close_episode failed for episode %d", eid)
+                    if _BEMO_ENRICH_BIN is not None:
+                        try:
+                            subprocess.Popen(
+                                [sys.executable, str(_BEMO_ENRICH_BIN),
+                                 "--episode", str(eid)],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                start_new_session=True,  # detach from our pgroup
+                                close_fds=True,
+                            )
+                            logger.info("Spawned bemo-enrich for episode %d", eid)
+                        except Exception:
+                            logger.exception(
+                                "Failed to spawn bemo-enrich for episode %d "
+                                "(cron --unprocessed will catch it later)",
+                                eid,
+                            )
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:

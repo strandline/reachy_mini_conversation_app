@@ -27,6 +27,13 @@ dependencies = [
     #Gemini
     "google-genai>=1.0.0",
 
+    #Anthropic (Branch #6: offline enrichment in scripts/bemo-enrich)
+    "anthropic>=0.40.0",
+
+    #Memory tools (Branch #1) — local embedding model for remember/recall/reflect.
+    #Previously installed out-of-band; tracking it here so `uv sync` keeps it.
+    "sentence-transformers>=2.7.0",
+
     #Reachy mini
     "reachy_mini_dances_library",
     "reachy_mini_toolbox",
