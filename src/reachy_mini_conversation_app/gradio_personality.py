@@ -98,6 +98,19 @@ class PersonalityUI:
                 shared.append(py.stem)
         except Exception:
             pass
+        # Externally-registered tools (REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY).
+        # Matches the loader convention in tools/core_tools.py: glob *.py and
+        # skip underscore-prefixed helpers. Without this, the CheckboxGroup
+        # choices omit entries the user has enabled in tools.txt and Gradio
+        # raises on every render.
+        try:
+            if config.TOOLS_DIRECTORY is not None and config.TOOLS_DIRECTORY.is_dir():
+                for py in config.TOOLS_DIRECTORY.glob("*.py"):
+                    if py.name.startswith("_"):
+                        continue
+                    shared.append(py.stem)
+        except Exception:
+            pass
         local: list[str] = []
         try:
             if selected != self.DEFAULT_OPTION:
@@ -105,7 +118,7 @@ class PersonalityUI:
                     local.append(py.stem)
         except Exception:
             pass
-        return sorted(shared), sorted(local)
+        return sorted(set(shared)), sorted(local)
 
     @staticmethod
     def _parse_enabled_tools(text: str) -> list[str]:
