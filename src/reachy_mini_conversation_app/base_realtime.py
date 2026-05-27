@@ -1393,28 +1393,45 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 await self.tool_manager.shutdown()
 
                 # Branch #6 Phase 1: close the capture episode and
-                # spawn the enricher detached so SIGKILL of the
-                # conv-app doesn't kill it. The enricher writes a
-                # summary + vibe + anti_patterns back to the DB; the
-                # next session's _build_state_block reads them.
+                # spawn the enricher detached so SIGKILL/teardown of
+                # the conv-app doesn't kill it. Uses close_episode_sync
+                # rather than `await close_episode` because by the time
+                # the asyncio finally runs, the loop is being canceled
+                # and any awaitable racing with teardown loses (verified
+                # 2026-05-27 — ended_at stayed NULL despite the await).
+                # SQLite writes are <5ms, so the sync block is cheap.
                 if _CAPTURE_STORE is not None and self._capture_episode_id is not None:
                     eid = self._capture_episode_id
                     self._capture_episode_id = None
                     try:
-                        await _CAPTURE_STORE.close_episode(eid)
+                        _CAPTURE_STORE.close_episode_sync(eid)
                     except Exception:
-                        logger.exception("close_episode failed for episode %d", eid)
+                        logger.exception("close_episode_sync failed for episode %d", eid)
                     if _BEMO_ENRICH_BIN is not None:
+                        # Redirect stdio to a per-episode log instead of
+                        # DEVNULL. Prior silent failures (the spawned
+                        # child ran but wrote nothing to the DB) were
+                        # un-diagnosable with DEVNULL. -v gives DEBUG
+                        # output so any future spawn-side errors are
+                        # captured. The conv-app closes its dup of the
+                        # log fd; the child keeps fd 1/2 pointed at it.
                         try:
-                            subprocess.Popen(
-                                [sys.executable, str(_BEMO_ENRICH_BIN),
-                                 "--episode", str(eid)],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                start_new_session=True,  # detach from our pgroup
-                                close_fds=True,
+                            log_dir = Path("/tmp/bemo-reachy-logs")
+                            log_dir.mkdir(parents=True, exist_ok=True)
+                            log_path = log_dir / f"enrich-{eid}.log"
+                            with open(log_path, "ab") as log_fp:
+                                subprocess.Popen(
+                                    [sys.executable, str(_BEMO_ENRICH_BIN),
+                                     "--episode", str(eid), "-v"],
+                                    stdout=log_fp,
+                                    stderr=subprocess.STDOUT,
+                                    start_new_session=True,
+                                    close_fds=True,
+                                )
+                            logger.info(
+                                "Spawned bemo-enrich for episode %d (log: %s)",
+                                eid, log_path,
                             )
-                            logger.info("Spawned bemo-enrich for episode %d", eid)
                         except Exception:
                             logger.exception(
                                 "Failed to spawn bemo-enrich for episode %d "

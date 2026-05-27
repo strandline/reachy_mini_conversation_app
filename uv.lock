@@ -4292,6 +4292,7 @@ local-vision = [
     { name = "accelerate" },
     { name = "num2words" },
     { name = "torch" },
+    { name = "torchvision" },
     { name = "transformers" },
 ]
 mediapipe-vision = [
@@ -4343,6 +4344,7 @@ requires-dist = [
     { name = "supervision", marker = "extra == 'yolo-vision'" },
     { name = "torch", marker = "extra == 'all-vision'", specifier = ">=2.1" },
     { name = "torch", marker = "extra == 'local-vision'", specifier = ">=2.1" },
+    { name = "torchvision", marker = "extra == 'local-vision'", specifier = ">=0.16" },
     { name = "transformers", marker = "extra == 'all-vision'", specifier = "==5.3.0" },
     { name = "transformers", marker = "extra == 'local-vision'", specifier = "==5.3.0" },
     { name = "ultralytics", marker = "extra == 'all-vision'" },
