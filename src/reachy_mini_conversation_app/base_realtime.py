@@ -76,6 +76,92 @@ def _load_capture_store() -> Any:
 _CAPTURE_STORE = _load_capture_store()
 
 
+def _load_memory_store() -> Any:
+    """Locate and import bemo-reachy's _memory_store, or return None.
+
+    Slice C: the entities/relationships graph lives in _memory_store and
+    backs the recall/remember tools. The state-block builder reads from
+    it to surface the entity roster (so the LLM walks in knowing which
+    pets belong to which household members and never confuses a cat for
+    a dog). Same path-discovery pattern as _load_capture_store.
+    """
+    tools_dir = os.environ.get("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
+    if not tools_dir:
+        return None
+    tools_dir = os.path.abspath(os.path.expanduser(tools_dir))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import _memory_store  # type: ignore[import-not-found]
+        return _memory_store
+    except ImportError:
+        return None
+
+
+_MEMORY_STORE = _load_memory_store()
+
+
+_KIND_PLURALS = {
+    "person": "people",
+    "pet": "pets",
+    "place": "places",
+    "organization": "organizations",
+    "event": "events",
+    "topic": "topics",
+    "thing": "things",
+}
+
+
+def _format_entity_roster(
+    entities: list[dict[str, Any]],
+    *,
+    max_per_kind: int = 12,
+    max_total: int = 40,
+) -> str:
+    """Render entities as a per-kind comma list for the state block.
+
+    Example: "people: Jason, Amanda Hannah, Rolf Eriksen · pets: Amelia
+    (dog), Beedi (dog), Cece (dog), Gingy (cat), Nut (cat)"
+
+    Pets show their species in parens when extra.species is set, so the
+    LLM never has to guess which entity is a dog vs a cat. Truncated at
+    `max_per_kind` per group and `max_total` overall; the rest are
+    summarized as "(+N more)".
+    """
+    if not entities:
+        return ""
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for e in entities:
+        by_kind.setdefault(e.get("kind", "thing"), []).append(e)
+    parts: list[str] = []
+    total = 0
+    # Stable ordering: person → pet → place → organization → … alphabetical fallback
+    kind_order = ["person", "pet", "place", "organization", "event", "topic", "thing"]
+    seen = set(by_kind.keys())
+    ordered_kinds = [k for k in kind_order if k in seen] + sorted(seen - set(kind_order))
+    for kind in ordered_kinds:
+        group = by_kind[kind]
+        label = _KIND_PLURALS.get(kind, kind)
+        rendered: list[str] = []
+        for e in group[:max_per_kind]:
+            name = e.get("name", "")
+            extra = e.get("extra") or {}
+            species = extra.get("species") if isinstance(extra, dict) else None
+            if kind == "pet" and species:
+                rendered.append(f"{name} ({species})")
+            else:
+                rendered.append(name)
+            total += 1
+            if total >= max_total:
+                break
+        if len(group) > max_per_kind:
+            rendered.append(f"(+{len(group) - max_per_kind} more)")
+        parts.append(f"{label}: {', '.join(rendered)}")
+        if total >= max_total:
+            break
+    return " · ".join(parts)
+
+
 def _resolve_enrich_bin() -> Optional[Path]:
     """Path to scripts/bemo-enrich derived from the external tools dir.
 
@@ -384,6 +470,22 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         scene_summary = self._scene_observation_summary()
         if scene_summary is not None:
             lines.append(f"What you can see right now: {scene_summary}")
+
+        # Slice C (Slice B preview): entity roster grouped by kind. Walking
+        # in with "Jason's pets: Gingy (cat), Nut (cat), Amelia (dog), …"
+        # eliminates the category-confusion failure mode where Bemo, asked
+        # about "the dogs", picked the freshest entities in working memory
+        # (Gingy and Nut, who are cats) and hallucinated their species.
+        if _MEMORY_STORE is not None:
+            try:
+                entities = await asyncio.to_thread(
+                    _MEMORY_STORE.list_all_entities_sync
+                )
+                roster = _format_entity_roster(entities)
+                if roster:
+                    lines.append(f"Known entities — {roster}")
+            except Exception:
+                logger.exception("entity roster build failed")
 
         # Phase 1: prior-episode recap + cross-session anti-pattern hint.
         if _CAPTURE_STORE is not None:
