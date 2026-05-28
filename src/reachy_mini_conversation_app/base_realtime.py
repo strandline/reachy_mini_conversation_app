@@ -101,6 +101,74 @@ def _load_memory_store() -> Any:
 _MEMORY_STORE = _load_memory_store()
 
 
+def _load_speaker_state() -> Any:
+    """Locate and import bemo-reachy's _speaker_state, or return None.
+
+    Slice D: read_dossier(is_current_speaker=True) caches who Bemo is
+    talking with; the state-block builder reads it to inject a
+    RELATIONSHIP CONTEXT block. Same path-discovery pattern as
+    _load_memory_store (the tools dir is already on sys.path by the time
+    this runs).
+    """
+    tools_dir = os.environ.get("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
+    if not tools_dir:
+        return None
+    tools_dir = os.path.abspath(os.path.expanduser(tools_dir))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import _speaker_state  # type: ignore[import-not-found]
+        return _speaker_state
+    except ImportError:
+        return None
+
+
+_SPEAKER_STATE = _load_speaker_state()
+
+
+# Slice D: affective self_note kinds → how they render in RELATIONSHIP
+# CONTEXT. Order = display order. affinity_update is intentionally omitted
+# from the block — it's history for the consolidator, not live steering.
+_AFFECTIVE_RENDER = (
+    ("interaction_cue",  "Cues"),
+    ("caution",          "Handle carefully"),
+    ("memorable_moment", "Shared history"),
+)
+
+
+def _format_relationship_context(
+    name: str,
+    affective: dict[str, list[dict[str, Any]]],
+    *,
+    max_per_kind: int = 3,
+) -> str | None:
+    """Render Bemo's affective notes about the current speaker.
+
+    Steering-only block — the leading line tells the LLM to act on these
+    but never quote them (guardrail layer 2; the tool description and
+    instructions.txt are layers 1 and 3). Returns None when there are no
+    affective notes to show, so the caller omits the block entirely.
+    """
+    if not affective:
+        return None
+    lines = [
+        f"--- RELATIONSHIP CONTEXT: {name} ---",
+        "(Steering only — act on these to shape your tone and choices. "
+        "Do NOT quote, paraphrase, or read them aloud.)",
+    ]
+    any_rendered = False
+    for kind, label in _AFFECTIVE_RENDER:
+        notes = affective.get(kind, [])
+        if not notes:
+            continue
+        any_rendered = True
+        rendered = "; ".join(n["content"] for n in notes[:max_per_kind])
+        lines.append(f"{label}: {rendered}")
+    if not any_rendered:
+        return None
+    return "\n".join(lines)
+
+
 _KIND_PLURALS = {
     "person": "people",
     "pet": "pets",
@@ -486,6 +554,28 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                     lines.append(f"Known entities — {roster}")
             except Exception:
                 logger.exception("entity roster build failed")
+
+        # Slice D: RELATIONSHIP CONTEXT for the current speaker. When Bemo
+        # has identified who she's talking to (via read_dossier with
+        # is_current_speaker=True), inject her affective notes about them
+        # so her tone is steered every turn — without her having to re-read
+        # the dossier. Steering-only; the block itself says "don't quote."
+        if _SPEAKER_STATE is not None and _MEMORY_STORE is not None:
+            try:
+                speaker = await asyncio.to_thread(
+                    _SPEAKER_STATE.get_current_speaker
+                )
+                if speaker is not None:
+                    affective = await asyncio.to_thread(
+                        _MEMORY_STORE.get_affective_notes_sync, speaker["name"]
+                    )
+                    rel_block = _format_relationship_context(
+                        speaker["name"], affective
+                    )
+                    if rel_block:
+                        lines.append(rel_block)
+            except Exception:
+                logger.exception("relationship context build failed")
 
         # Phase 1: prior-episode recap + cross-session anti-pattern hint.
         if _CAPTURE_STORE is not None:
