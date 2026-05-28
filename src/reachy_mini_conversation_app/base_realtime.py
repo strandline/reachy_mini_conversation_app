@@ -544,32 +544,31 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         trend = store.valence_trend()
         if trend is None:
             return None
-        # Expressive adjective for the dominant recent emotion (Inworld's
-        # documented labels). Falls back to a direction-generic word when the
-        # label is neutral/calm (a drop from upbeat to flat has no negative
-        # label but is still a cooling).
-        adjectives = {
+        # Per-label adjectives apply ONLY to the down direction — they are all
+        # negative emotions. An UP shift can still carry a negative
+        # `recent_label` (e.g. high-confidence "sad" easing to low-confidence
+        # "sad" raises valence while the dominant label stays "sad"), so reusing
+        # the label would emit "trended sadder ... match that lift." For UP we
+        # always use the generic brightening word; for DOWN we fall back to
+        # "flatter" when the recent label is neutral/calm (a cooling from upbeat
+        # has no negative label but is still a drop).
+        down_adjectives = {
             "sad": "sadder",
             "tender": "more tender",
             "angry": "more on edge",
             "disgusted": "more put-off",
             "fearful": "more anxious",
-            "happy": "brighter",
         }
-        label = trend.get("recent_label")
-        adj = adjectives.get((label or "").lower())
+        label = (trend.get("recent_label") or "").lower()
         if trend["direction"] == "down":
-            if adj is None:
-                adj = "flatter"
+            adj = down_adjectives.get(label, "flatter")
             return (
                 f"User's voice has trended {adj} over the last few turns "
                 "(vs. earlier in this chat) — soften, slow down, and ease off "
                 "the topic you just raised."
             )
-        if adj is None:
-            adj = "brighter"
         return (
-            f"User's voice has trended {adj} over the last few turns "
+            "User's voice has trended brighter over the last few turns "
             "(vs. earlier in this chat) — you can match that lift."
         )
 
