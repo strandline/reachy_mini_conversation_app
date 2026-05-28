@@ -544,3 +544,293 @@ async def test_send_idle_signal_triggers_face_recognition(face_ctx, monkeypatch)
     await ctx.handler.send_idle_signal(60.0)
 
     face_scan.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Part D — enroll_face + correct_identity tools
+#
+# Same integration harness as Part C (real outer-repo stores on a temp DB via
+# face_ctx). The tools are Tool subclasses called directly with face_ctx.handler.deps
+# (carries the fake camera + recognizer, the open episode, the refresh spy, and the
+# shared session_recognized_ids set).
+# ---------------------------------------------------------------------------
+
+import reachy_mini_conversation_app.tools.core_tools as ct  # noqa: E402
+from reachy_mini_conversation_app.tools.enroll_face import EnrollFace  # noqa: E402
+from reachy_mini_conversation_app.tools.correct_identity import CorrectIdentity  # noqa: E402
+
+
+def _entity_count(ms) -> int:
+    return len(ms.list_all_entities_sync())
+
+
+def _entity_by_name(ms, name: str) -> dict | None:
+    for e in ms.list_all_entities_sync():
+        if e["name"].lower() == name.lower():
+            return e
+    return None
+
+
+# --- enroll_face ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enroll_face_new_creates_entity_and_seeds(face_ctx):
+    """A novel face+name creates an entity, seeds a centroid, logs an enroll sighting, pins."""
+    ctx = face_ctx
+    _set_probe(ctx, _onehot(0))  # nobody enrolled yet → match set empty → 'new'
+
+    res = await EnrollFace()(ctx.handler.deps, name="Jason")
+
+    assert res["status"] == "enrolled"
+    assert res["action"] == "new"
+    assert res["name"] == "Jason"
+    eid = res["entity_id"]
+    assert _entity_count(ctx.ms) == 1
+    # Seeded → now matchable.
+    match_set = ctx.ms.get_face_match_set_sync()
+    assert any(p["entity_id"] == eid and p["name"] == "Jason" for p in match_set)
+    sightings = _all_sightings(ctx.ms)
+    assert len(sightings) == 1
+    assert sightings[0]["source"] == "enroll"
+    assert sightings[0]["entity_id"] == eid
+    assert ctx.ss.get_current_speaker() == {"id": eid, "name": "Jason"}
+    assert "Jason" in _participants(ctx.ms, ctx.episode_id)
+    assert eid in ctx.handler.deps.session_recognized_ids  # consent → seeds continuity
+    ctx.refresh.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enroll_face_reuse_known_face_adds_alias_no_duplicate(face_ctx):
+    """A face that already matches reuses the entity, adds the new name as an alias."""
+    ctx = face_ctx
+    eid = ctx.ms.upsert_entity_sync("Jeff", kind="person")
+    ctx.ms.seed_face_centroid_sync(eid, _onehot(0))
+    _set_probe(ctx, _onehot(0))  # cosine 1.0 ≥ high → face known → reuse
+
+    res = await EnrollFace()(ctx.handler.deps, name="Jeff Gordon")
+
+    assert res["action"] == "reuse"
+    assert res["entity_id"] == eid
+    assert res["name"] == "Jeff"  # canonical, not the spoken fuller name
+    assert _entity_count(ctx.ms) == 1  # NO duplicate entity
+    jeff = _entity_by_name(ctx.ms, "Jeff")
+    assert any(a.lower() == "jeff gordon" for a in jeff["aliases"])
+    # Reinforcing enroll sighting under the existing entity.
+    sightings = _all_sightings(ctx.ms)
+    assert len(sightings) == 1
+    assert sightings[0]["source"] == "enroll"
+    assert sightings[0]["entity_id"] == eid
+    assert ctx.ss.get_current_speaker()["name"] == "Jeff"
+
+
+@pytest.mark.asyncio
+async def test_enroll_face_name_collision_does_not_enroll(face_ctx):
+    """A new face whose spoken name is taken → collision, no entity/sighting/pin."""
+    ctx = face_ctx
+    # 'Jeff' exists but has NO face centroid → this face won't match (collision).
+    ctx.ms.upsert_entity_sync("Jeff", kind="person")
+    _set_probe(ctx, _onehot(5))
+
+    res = await EnrollFace()(ctx.handler.deps, name="Jeff")
+
+    assert res["status"] == "collision"
+    assert _entity_count(ctx.ms) == 1  # no new entity
+    assert _all_sightings(ctx.ms) == []  # nothing logged
+    assert ctx.ss.get_current_speaker() is None  # not pinned
+    ctx.refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enroll_face_no_frame_returns_error(face_ctx):
+    """No camera frame → error, no writes."""
+    ctx = face_ctx
+    ctx.camera.get_latest_frame.return_value = None
+
+    res = await EnrollFace()(ctx.handler.deps, name="Jason")
+
+    assert "error" in res
+    assert _entity_count(ctx.ms) == 0
+    assert _all_sightings(ctx.ms) == []
+
+
+@pytest.mark.asyncio
+async def test_enroll_face_no_recognizer_returns_error(face_ctx):
+    """No recognizer on deps → error, no writes, recognizer never invoked."""
+    ctx = face_ctx
+    ctx.handler.deps.face_recognizer = None
+
+    res = await EnrollFace()(ctx.handler.deps, name="Jason")
+
+    assert "error" in res
+    assert _entity_count(ctx.ms) == 0
+    ctx.recognizer.embed_largest.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_enroll_face_empty_name_returns_error(face_ctx):
+    """Empty name → error before any embedding happens."""
+    ctx = face_ctx
+
+    res = await EnrollFace()(ctx.handler.deps, name="   ")
+
+    assert "error" in res
+    ctx.recognizer.embed_largest.assert_not_called()
+    assert _entity_count(ctx.ms) == 0
+
+
+@pytest.mark.asyncio
+async def test_enroll_face_no_face_detected(face_ctx):
+    """A frame with no detectable face → no_face status, no writes."""
+    ctx = face_ctx
+    ctx.recognizer.embed_largest.return_value = None
+
+    res = await EnrollFace()(ctx.handler.deps, name="Jason")
+
+    assert res["status"] == "no_face"
+    assert _entity_count(ctx.ms) == 0
+    assert _all_sightings(ctx.ms) == []
+
+
+# --- correct_identity ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_relabels_session_sightings_and_repins(face_ctx):
+    """A misgreet correction relabels this episode's recognize sightings to the new name."""
+    ctx = face_ctx
+    wrong = ctx.ms.upsert_entity_sync("Wrongname", kind="person")
+    # Two auto-recognize sightings logged under the wrong entity this episode.
+    emb = _onehot(0)
+    s1 = ctx.ms.log_face_sighting_sync(
+        entity_id=wrong, episode_id=ctx.episode_id, embedding=emb,
+        confidence=0.5, source="recognize")
+    s2 = ctx.ms.log_face_sighting_sync(
+        entity_id=wrong, episode_id=ctx.episode_id, embedding=emb,
+        confidence=0.5, source="recognize")
+    # No recognizer-bind for this test → isolate the relabel path.
+    ctx.handler.deps.face_recognizer = None
+
+    res = await CorrectIdentity()(ctx.handler.deps, name="Maya")
+
+    assert res["status"] == "corrected"
+    assert res["name"] == "Maya"
+    assert res["relabeled"] == 2
+    maya = _entity_by_name(ctx.ms, "Maya")
+    conn = ctx.ms._connect()
+    try:
+        rows = conn.execute(
+            "SELECT entity_id, source FROM face_sightings WHERE id IN (?, ?)", (s1, s2)
+        ).fetchall()
+    finally:
+        conn.close()
+    assert all(r["entity_id"] == maya["id"] for r in rows)
+    assert all(r["source"] == "correct" for r in rows)
+    assert ctx.ss.get_current_speaker() == {"id": maya["id"], "name": "Maya"}
+    assert "Maya" in _participants(ctx.ms, ctx.episode_id)
+    ctx.refresh.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_clear_unsets_identity(face_ctx):
+    """clear=true relabels this session's sightings to NULL and clears the pin."""
+    ctx = face_ctx
+    wrong = ctx.ms.upsert_entity_sync("Wrongname", kind="person")
+    ctx.ss.set_current_speaker(wrong, "Wrongname")
+    s1 = ctx.ms.log_face_sighting_sync(
+        entity_id=wrong, episode_id=ctx.episode_id, embedding=_onehot(0),
+        confidence=0.5, source="recognize")
+    ctx.handler.deps.face_recognizer = None
+
+    res = await CorrectIdentity()(ctx.handler.deps, clear=True)
+
+    assert res["cleared"] is True
+    conn = ctx.ms._connect()
+    try:
+        row = conn.execute(
+            "SELECT entity_id, source FROM face_sightings WHERE id = ?", (s1,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["entity_id"] is None
+    assert row["source"] == "correct"
+    assert ctx.ss.get_current_speaker() is None
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_binds_current_frame_when_recognizer_present(face_ctx):
+    """With a recognizer, correct binds the current frame: a correct-sighting + centroid seed."""
+    ctx = face_ctx
+    wrong = ctx.ms.upsert_entity_sync("Wrongname", kind="person")
+    ctx.ms.log_face_sighting_sync(
+        entity_id=wrong, episode_id=ctx.episode_id, embedding=_onehot(0),
+        confidence=0.5, source="recognize")
+    _set_probe(ctx, _onehot(1))  # current frame embedding to bind to the corrected entity
+
+    res = await CorrectIdentity()(ctx.handler.deps, name="Maya")
+
+    assert res["status"] == "corrected"
+    maya = _entity_by_name(ctx.ms, "Maya")
+    # The relabeled sighting plus a fresh frame-bound correct sighting under Maya.
+    maya_sightings = [
+        s for s in _all_sightings(ctx.ms)
+        if s["entity_id"] == maya["id"] and s["source"] == "correct"
+    ]
+    assert len(maya_sightings) >= 2
+    # Centroid seeded so same-session recognition flips immediately.
+    assert any(p["entity_id"] == maya["id"] for p in ctx.ms.get_face_match_set_sync())
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_no_args_errors(face_ctx):
+    """Neither a name nor clear → error."""
+    ctx = face_ctx
+
+    res = await CorrectIdentity()(ctx.handler.deps, name="  ")
+
+    assert "error" in res
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_no_episode_degrades(face_ctx):
+    """No open episode → skip relabel/merge, still re-pin, return corrected with relabeled=0."""
+    ctx = face_ctx
+    ctx.handler.deps.capture_episode_id = None
+    ctx.handler.deps.face_recognizer = None
+
+    res = await CorrectIdentity()(ctx.handler.deps, name="Maya")
+
+    assert res["status"] == "corrected"
+    assert res["relabeled"] == 0
+    maya = _entity_by_name(ctx.ms, "Maya")
+    assert ctx.ss.get_current_speaker() == {"id": maya["id"], "name": "Maya"}
+
+
+# --- gate ----------------------------------------------------------------
+
+
+def test_face_tools_gated_on_recognizer():
+    """get_active_tool_specs lists the face tools only when a recognizer is present."""
+    # Rebuild the registry so the freshly-imported tool classes are included
+    # (ALL_TOOL_SPECS is built once at core_tools import, before these load).
+    all_tools = {c.name: c() for c in ct.get_concrete_subclasses(ct.Tool)}
+    specs = [t.spec() for t in all_tools.values()]
+    orig_tools, orig_specs = ct.ALL_TOOLS, ct.ALL_TOOL_SPECS
+    ct.ALL_TOOLS, ct.ALL_TOOL_SPECS = all_tools, specs
+    try:
+        with_rec = ToolDependencies(
+            reachy_mini=MagicMock(), movement_manager=MagicMock(),
+            face_recognizer=MagicMock(),
+        )
+        names_with = {s["name"] for s in ct.get_active_tool_specs(with_rec)}
+        assert "enroll_face" in names_with
+        assert "correct_identity" in names_with
+
+        without_rec = ToolDependencies(
+            reachy_mini=MagicMock(), movement_manager=MagicMock(),
+        )
+        names_without = {s["name"] for s in ct.get_active_tool_specs(without_rec)}
+        assert "enroll_face" not in names_without
+        assert "correct_identity" not in names_without
+    finally:
+        ct.ALL_TOOLS, ct.ALL_TOOL_SPECS = orig_tools, orig_specs

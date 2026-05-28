@@ -90,3 +90,33 @@ def test_builtin_profile_can_load_profile_local_tools(
     core_tools_mod = _reload_core_tools()
 
     assert "sweep_look" in core_tools_mod.ALL_TOOLS
+
+
+def test_face_id_tools_load_via_tools_txt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """enroll_face + correct_identity load as shared src tools from a profile tools.txt.
+
+    Phase-2 face-ID tools are NOT auto-discovered (AUTOLOAD_EXTERNAL_TOOLS
+    defaults False, and discovery only globs the EXTERNAL tools dir). They load
+    exactly like `camera` — by an explicit line in the active profile's
+    tools.txt — so both files MUST be listed there.
+    """
+    profile_name = "face_id_profile_test"
+    external_profiles_root = tmp_path / "external_profiles"
+    profile_dir = external_profiles_root / profile_name
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "instructions.txt").write_text("hello\n", encoding="utf-8")
+    (profile_dir / "tools.txt").write_text(
+        "enroll_face\ncorrect_identity\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", profile_name)
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", external_profiles_root)
+    monkeypatch.setattr(config_mod.config, "TOOLS_DIRECTORY", None)
+    monkeypatch.setattr(config_mod.config, "AUTOLOAD_EXTERNAL_TOOLS", False)
+
+    core_tools_mod = _reload_core_tools()
+
+    assert "enroll_face" in core_tools_mod.ALL_TOOLS
+    assert "correct_identity" in core_tools_mod.ALL_TOOLS

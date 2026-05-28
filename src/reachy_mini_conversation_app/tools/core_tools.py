@@ -301,6 +301,12 @@ def get_active_tool_specs(deps: ToolDependencies) -> list[Dict[str, Any]]:
     exclusion_list: list[str] = []
     if not (deps.camera_worker and deps.camera_worker.head_tracker):
         exclusion_list.append("head_tracking")
+    # Face-ID (Phase 2): hide the enroll/correct tools when no recognizer is
+    # loaded (insightface absent or no camera) so the model never offers a
+    # capability that would only return an error. The tools also no-op
+    # gracefully on their own — belt and suspenders.
+    if getattr(deps, "face_recognizer", None) is None:
+        exclusion_list += ["enroll_face", "correct_identity"]
     return get_tool_specs(exclusion_list)
 
 
