@@ -96,6 +96,14 @@ class CorrectIdentity(Tool):
 
         # Relabel this episode's mis-attributed recognize sightings. Degrade
         # (don't error) when there's no open episode.
+        #
+        # v1 assumption (single conversant per correction): relabels ALL of the
+        # episode's recognize sightings (entity_id=None below), not just the
+        # current speaker's. Correct for Bemo's predominantly 1:1 use; in the
+        # rare two-people-share-an-episode case it over-relabels the earlier
+        # (correctly-recognized) person onto the corrected name. A precise
+        # turn-timestamp-scoped relabel is a Phase-3 refinement. The helper's
+        # entity_id= filter exists for that future scoping.
         eid = _episode_id(deps)
         relabeled = 0
         if eid is not None:

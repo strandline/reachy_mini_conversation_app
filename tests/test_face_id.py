@@ -782,6 +782,44 @@ async def test_correct_identity_binds_current_frame_when_recognizer_present(face
 
 
 @pytest.mark.asyncio
+async def test_correct_identity_relabels_whole_episode_single_conversant_assumption(face_ctx):
+    """PINS v1 contract: correct relabels EVERY 'recognize' sighting this episode.
+
+    Decision (2026-05-28): correct_identity assumes one conversant per
+    correction — it relabels all of the episode's recognize sightings, not just
+    the current speaker's. In a rare two-people-share-an-episode case this
+    over-relabels the earlier (correctly-recognized) person onto the corrected
+    name. Accepted for v1 (Bemo's use is predominantly 1:1); a precise
+    turn-timestamp-scoped relabel is a Phase-3 refinement. This test guards the
+    current behavior — the Phase-3 fix will deliberately change it.
+    """
+    ctx = face_ctx
+    alice = ctx.ms.upsert_entity_sync("Alice", kind="person")
+    # Two distinct people's recognize sightings in the same episode.
+    s_alice = ctx.ms.log_face_sighting_sync(
+        entity_id=alice, episode_id=ctx.episode_id, embedding=_onehot(0),
+        confidence=0.9, source="recognize")
+    s_unknown = ctx.ms.log_face_sighting_sync(
+        entity_id=None, episode_id=ctx.episode_id, embedding=_onehot(1),
+        confidence=0.4, source="recognize")
+    ctx.handler.deps.face_recognizer = None  # isolate the relabel path
+
+    res = await CorrectIdentity()(ctx.handler.deps, name="Bob")
+
+    assert res["relabeled"] == 2  # BOTH relabeled — the documented over-reach
+    bob = _entity_by_name(ctx.ms, "Bob")
+    conn = ctx.ms._connect()
+    try:
+        rows = conn.execute(
+            "SELECT entity_id FROM face_sightings WHERE id IN (?, ?)",
+            (s_alice, s_unknown),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert all(r["entity_id"] == bob["id"] for r in rows)
+
+
+@pytest.mark.asyncio
 async def test_correct_identity_no_args_errors(face_ctx):
     """Neither a name nor clear → error."""
     ctx = face_ctx
