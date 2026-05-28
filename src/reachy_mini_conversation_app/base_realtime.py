@@ -544,20 +544,20 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         trend = store.valence_trend()
         if trend is None:
             return None
-        # Expressive adjective for the dominant recent emotion; falls back to a
-        # direction-generic word when the label is neutral/calm (e.g. a drop
-        # from upbeat to flat has no negative label but is still a cooling).
+        # Expressive adjective for the dominant recent emotion (Inworld's
+        # documented labels). Falls back to a direction-generic word when the
+        # label is neutral/calm (a drop from upbeat to flat has no negative
+        # label but is still a cooling).
         adjectives = {
-            "sad": "sadder", "sadness": "sadder", "tender": "more tender",
-            "annoyed": "more on edge", "angry": "more on edge",
-            "anger": "more on edge", "disgust": "more put-off",
-            "anxious": "more anxious", "fear": "more anxious",
-            "fearful": "more anxious", "afraid": "more anxious",
-            "happy": "brighter", "joy": "brighter", "joyful": "brighter",
-            "excited": "more excited", "amused": "lighter",
+            "sad": "sadder",
+            "tender": "more tender",
+            "angry": "more on edge",
+            "disgusted": "more put-off",
+            "fearful": "more anxious",
+            "happy": "brighter",
         }
         label = trend.get("recent_label")
-        adj = adjectives.get(label or "")
+        adj = adjectives.get((label or "").lower())
         if trend["direction"] == "down":
             if adj is None:
                 adj = "flatter"

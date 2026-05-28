@@ -48,6 +48,16 @@ def test_valence_none_for_unmapped_label():
     assert _profile("unclear", 0.9, 0.0).valence() is None
 
 
+def test_valence_disgusted_is_mapped():
+    """Inworld's exact label is "disgusted" (not "disgust") — must be mapped."""
+    assert _profile("disgusted", 1.0, 0.0).valence() == -0.6
+
+
+def test_valence_surprised_excluded():
+    """"surprised" is arousal-ambiguous (delight vs alarm) → excluded, like "unclear"."""
+    assert _profile("surprised", 0.9, 0.0).valence() is None
+
+
 def test_valence_case_insensitive():
     """Label lookup is case-insensitive."""
     assert _profile("HAPPY", 1.0, 0.0).valence() == 1.0

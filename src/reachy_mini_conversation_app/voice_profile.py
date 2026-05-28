@@ -41,36 +41,31 @@ __all__ = [
 ]
 
 
-# Slice F (F-live): scalar valence anchors for Inworld emotion labels, used to
-# turn categorical emotion into a -1..1 signal for trend detection. The five
-# doc-pinned anchors are happy +1 / neutral 0 / sad -1 / angry -0.6 / fear -0.7
-# (see docs/emotional-layer-design.md "Tunables"); the rest are clearly-signed
-# synonyms Inworld may emit. Labels NOT in this map are excluded from valence
-# (treated as None) rather than forced to 0 — guessing the sign of an unknown
-# label is worse than ignoring it. This map is a tunable; validate against real
-# Inworld output (design-doc open question #2) before trusting magnitudes.
+# Slice F (F-live): scalar valence anchors for Inworld's emotion labels, used
+# to turn categorical emotion into a -1..1 signal for trend detection. Keyed to
+# Inworld's EXACT documented vocabulary (https://docs.inworld.ai/stt/voice-
+# profiles): tender, sad, calm, neutral, happy, angry, fearful, surprised,
+# disgusted, unclear. The five doc-pinned anchors are happy +1 / neutral 0 /
+# sad -1 / angry -0.6 / fearful -0.7 (see docs/emotional-layer-design.md
+# "Tunables"). Two labels are deliberately absent so valence() returns None and
+# valence_trend() drops them rather than coercing to 0:
+#   - "surprised": arousal-dominant with ambiguous sign (delight vs. alarm);
+#     arousal is out of scope for F-live basics.
+#   - "unclear": Inworld's no-confident-classification sentinel.
+# This map is a tunable; validate magnitudes against real Inworld output
+# (design-doc open question #2). Lookup is case-insensitive (see valence()).
 EMOTION_VALENCE: dict[str, float] = {
     # positive
     "happy": 1.0,
-    "joy": 1.0,
-    "joyful": 1.0,
-    "excited": 0.8,
-    "amused": 0.6,
     # neutral / relaxed
     "calm": 0.1,
     "neutral": 0.0,
     # negative
     "tender": -0.3,  # soft / vulnerable register — lean gentle (matches profile)
-    "annoyed": -0.4,
     "angry": -0.6,
-    "anger": -0.6,
-    "disgust": -0.6,
-    "anxious": -0.6,
-    "fear": -0.7,
+    "disgusted": -0.6,
     "fearful": -0.7,
-    "afraid": -0.7,
     "sad": -1.0,
-    "sadness": -1.0,
 }
 
 
