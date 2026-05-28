@@ -126,14 +126,37 @@ def _load_speaker_state() -> Any:
 _SPEAKER_STATE = _load_speaker_state()
 
 
-# Slice D: affective self_note kinds → how they render in RELATIONSHIP
-# CONTEXT. Order = display order. affinity_update is intentionally omitted
-# from the block — it's history for the consolidator, not live steering.
-_AFFECTIVE_RENDER = (
+# Slice D: affective self_note kinds split into two trust tiers.
+#   STEERING — tone/handling metadata Bemo acts on but must NEVER speak
+#     ("don't recite that you're being warm because he's your creator").
+#   SHAREABLE — warm history she's free to bring up. Lumping these under
+#     the never-quote guardrail made her refuse to tell her own birthday
+#     in live testing, so memorable moments live here, not in steering.
+# affinity_update is omitted from both — it's consolidator history, not
+# live context.
+_STEERING_RENDER = (
     ("interaction_cue",  "Cues"),
     ("caution",          "Handle carefully"),
+)
+_SHAREABLE_RENDER = (
     ("memorable_moment", "Shared history"),
 )
+
+
+def _render_affective_group(
+    affective: dict[str, list[dict[str, Any]]],
+    render_spec: tuple[tuple[str, str], ...],
+    max_per_kind: int,
+) -> list[str]:
+    """Render one trust tier's notes as 'Label: a; b; c' lines."""
+    out: list[str] = []
+    for kind, label in render_spec:
+        notes = affective.get(kind, [])
+        if not notes:
+            continue
+        rendered = "; ".join(n["content"] for n in notes[:max_per_kind])
+        out.append(f"{label}: {rendered}")
+    return out
 
 
 def _format_relationship_context(
@@ -144,27 +167,37 @@ def _format_relationship_context(
 ) -> str | None:
     """Render Bemo's affective notes about the current speaker.
 
-    Steering-only block — the leading line tells the LLM to act on these
-    but never quote them (guardrail layer 2; the tool description and
-    instructions.txt are layers 1 and 3). Returns None when there are no
-    affective notes to show, so the caller omits the block entirely.
+    Two tiers: a steering block she acts on but never quotes (guardrail
+    layer 2; tool description + instructions.txt are layers 1 and 3), and
+    a shareable 'Shared history' block she MAY bring up warmly. Returns
+    None when there's nothing to show, so the caller omits it entirely.
     """
     if not affective:
         return None
-    lines = [
-        f"--- RELATIONSHIP CONTEXT: {name} ---",
-        "(Steering only — act on these to shape your tone and choices. "
-        "Do NOT quote, paraphrase, or read them aloud.)",
-    ]
-    any_rendered = False
-    for kind, label in _AFFECTIVE_RENDER:
-        notes = affective.get(kind, [])
-        if not notes:
-            continue
-        any_rendered = True
-        rendered = "; ".join(n["content"] for n in notes[:max_per_kind])
-        lines.append(f"{label}: {rendered}")
-    if not any_rendered:
+    lines = [f"--- RELATIONSHIP CONTEXT: {name} ---"]
+
+    steering = _render_affective_group(
+        affective, _STEERING_RENDER, max_per_kind
+    )
+    if steering:
+        lines.append(
+            "(Steering only — act on these to shape your tone and choices. "
+            "Do NOT quote, paraphrase, or read them aloud.)"
+        )
+        lines.extend(steering)
+
+    shareable = _render_affective_group(
+        affective, _SHAREABLE_RENDER, max_per_kind
+    )
+    if shareable:
+        lines.append(
+            "(Shared history — yours to bring up warmly when it fits. "
+            "These you CAN talk about.)"
+        )
+        lines.extend(shareable)
+
+    # Only the header rendered → nothing useful; omit the block.
+    if len(lines) == 1:
         return None
     return "\n".join(lines)
 
