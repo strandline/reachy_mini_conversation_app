@@ -994,7 +994,10 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 else:
                     # Face detected but matched no one: keep the unmatched
                     # sighting (offline review / later correction) and cue Bemo
-                    # to offer to remember them.
+                    # to offer to remember them. Clear any prior recognition —
+                    # an unknown face present is a positive signal the previously
+                    # recognized speaker has left, so the state block must stop
+                    # naming them (and stop suppressing this newcomer's cue).
                     await asyncio.to_thread(
                         _MEMORY_STORE.log_face_sighting_sync,
                         entity_id=None,
@@ -1003,6 +1006,7 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         confidence=d["score"],
                         source="recognize",
                     )
+                    self._latest_face_recognition = None
                     self._face_unrecognized_present = True
             except Exception:
                 logger.exception("Face recognition failed")

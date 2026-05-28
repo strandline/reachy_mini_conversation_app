@@ -332,6 +332,29 @@ async def test_run_face_recognition_none_tier_logs_unmatched_and_sets_flag(face_
 
 
 @pytest.mark.asyncio
+async def test_run_face_recognition_none_tier_clears_stale_match(face_ctx):
+    """An unknown face (NONE tier) clears a prior fresh recognition (A→B swap).
+
+    Without clearing, the state block would keep naming the person who left
+    (cache fresh for up to _FACE_STALE_SECONDS) AND suppress the newcomer's
+    enrollment cue. NONE means a face IS present but unmatched — a positive
+    signal the prior speaker is gone — so the cache is dropped, like NO-FACE.
+    """
+    ctx = face_ctx
+    eid = ctx.ms.upsert_entity_sync("Alice", kind="person")
+    ctx.ms.seed_face_centroid_sync(eid, _onehot(0))
+    _set_probe(ctx, _onehot(0))  # Alice HIGH-matched → cached
+    await ctx.handler._run_face_recognition()
+    assert ctx.handler._latest_face_recognition is not None
+
+    _set_probe(ctx, _onehot(7))  # unknown face, orthogonal → NONE tier
+    await ctx.handler._run_face_recognition(force=True)  # force past the cooldown
+
+    assert ctx.handler._latest_face_recognition is None  # Alice's stale name dropped
+    assert ctx.handler._face_unrecognized_present is True
+
+
+@pytest.mark.asyncio
 async def test_run_face_recognition_no_face_clears_flag(face_ctx):
     """No face in frame → no writes, cache cleared, cue flag off, no pin."""
     ctx = face_ctx
