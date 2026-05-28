@@ -126,6 +126,33 @@ def _load_speaker_state() -> Any:
 _SPEAKER_STATE = _load_speaker_state()
 
 
+def _load_face_match() -> Any:
+    """Locate and import bemo-reachy's _face_match, or return None.
+
+    Face-ID Phase 2: the two-tier matching / enrollment decision logic
+    (score_profiles, decide, resolve_enrollment, corroboration_ok) lives
+    in the workspace's tools/ dir. _run_face_recognition delegates every
+    identity decision to it so this glue stays decision-free; the conv
+    app stays usable without it (the recognizer no-ops when None). Same
+    path-discovery pattern as _load_speaker_state (the tools dir is
+    already on sys.path by the time this runs).
+    """
+    tools_dir = os.environ.get("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
+    if not tools_dir:
+        return None
+    tools_dir = os.path.abspath(os.path.expanduser(tools_dir))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import _face_match  # type: ignore[import-not-found]
+        return _face_match
+    except ImportError:
+        return None
+
+
+_FACE_MATCH = _load_face_match()
+
+
 # Slice D: affective self_note kinds split into two trust tiers.
 #   STEERING — tone/handling metadata Bemo acts on but must NEVER speak
 #     ("don't recite that you're being warm because he's your creator").
@@ -298,6 +325,47 @@ def _resolve_scene_cooldown_seconds() -> float:
 
 _SCENE_COOLDOWN_SECONDS: Final[float] = _resolve_scene_cooldown_seconds()
 _SCENE_STALE_SECONDS: Final[float] = 600.0  # 10 minutes
+
+
+def _resolve_face_cooldown_seconds() -> float:
+    """Read REACHY_MINI_FACE_COOLDOWN_SECONDS or default to 60s."""
+    raw = os.environ.get("REACHY_MINI_FACE_COOLDOWN_SECONDS")
+    if raw is None:
+        return 60.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid REACHY_MINI_FACE_COOLDOWN_SECONDS=%r; using default 60s",
+            raw,
+        )
+        return 60.0
+
+
+def _resolve_face_threshold(name: str, default: float) -> float:
+    """Read a float face threshold env var, falling back to default on bad input."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+
+# Face-ID (Phase 2) tuning. Thresholds are env-overridable so sim tuning (E3)
+# never forces a second submodule commit; code defaults stay at 0.45/0.30.
+_FACE_COOLDOWN_SECONDS: Final[float] = _resolve_face_cooldown_seconds()
+_FACE_STALE_SECONDS: Final[float] = _resolve_face_threshold(
+    "REACHY_MINI_FACE_STALE_SECONDS", 600.0
+)
+_FACE_HIGH_THRESHOLD: Final[float] = _resolve_face_threshold(
+    "REACHY_MINI_FACE_HIGH_THRESHOLD", 0.45
+)
+_FACE_LOW_THRESHOLD: Final[float] = _resolve_face_threshold(
+    "REACHY_MINI_FACE_LOW_THRESHOLD", 0.30
+)
 _SCENE_NOTABLE_PROMPT: Final[str] = (
     "Briefly, in one sentence: what's notable, new, or visually "
     "interesting in this scene? Mention objects, people, clothing, "
@@ -636,6 +704,20 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         if scene_summary is not None:
             lines.append(f"What you can see right now: {scene_summary}")
 
+        # Face-ID (Phase 2): exactly one of these two lines, or neither. The
+        # "who you can see" line wins; the enrollment cue is gated on an active
+        # conversant (_user_turn_count > 0) — the startup scan runs before
+        # anyone speaks and is then cooldown-locked, so gating in the recognizer
+        # would suppress the cue for the first minute of conversation.
+        face_name = self._face_recognition_summary()
+        if face_name is not None:
+            lines.append(f"Who you can see right now: {face_name}")
+        elif self._face_unrecognized_present and getattr(self, "_user_turn_count", 0) > 0:
+            lines.append(
+                "(you don't yet recognize who you're talking with — you may "
+                "offer to remember them if it feels natural)"
+            )
+
         # Slice C (Slice B preview): entity roster grouped by kind. Walking
         # in with "Jason's pets: Gingy (cat), Nut (cat), Amelia (dog), …"
         # eliminates the category-confusion failure mode where Bemo, asked
@@ -723,6 +805,21 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             return None
         return text
 
+    def _face_recognition_summary(self) -> str | None:
+        """Return the recognized person's name if a fresh recognition is cached.
+
+        Mirrors _scene_observation_summary: suppresses recognitions older than
+        the stale window (same asyncio loop clock as the cache ts) so the state
+        block never claims to "see" someone who left ten minutes ago.
+        """
+        cached = self._latest_face_recognition
+        if cached is None:
+            return None
+        _entity_id, name, ts = cached
+        if asyncio.get_event_loop().time() - ts > _FACE_STALE_SECONDS:
+            return None
+        return name
+
     async def _run_scene_observation(self, *, force: bool = False) -> None:
         """Run a SmolVLM2 scan of the current camera frame.
 
@@ -786,6 +883,150 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 "session refresh after scene observation failed; "
                 "next natural session.update will pick it up"
             )
+
+    async def _run_face_recognition(self, *, force: bool = False) -> None:
+        """Recognize the largest face in the current frame and route by tier.
+
+        Mirrors _run_scene_observation: bails silently when face-ID isn't wired,
+        cooldown-gated (unless force), single-flight via a lock. Every identity
+        decision is delegated to the merged _face_match helpers — this method is
+        decision-free glue. Per-tier side-effects:
+
+          - match: log a recognize sighting, pin + attribute the speaker, cache,
+            add to the session-continuity set, refresh the session.
+          - gray + corroborated: same, but do NOT add to the continuity set (a
+            pin-corroborated gray-accept must not self-corroborate later scans).
+          - gray + uncorroborated: pure no-op.
+          - none (face, but no match): log an unmatched sighting, raise the
+            enrollment-cue flag.
+          - no face: clear the cache and the cue flag.
+        """
+        if (
+            self.deps.camera_worker is None
+            or getattr(self.deps, "face_recognizer", None) is None
+            or _MEMORY_STORE is None
+            or _FACE_MATCH is None
+        ):
+            return
+        if self._face_scan_lock.locked():
+            return
+        now = asyncio.get_event_loop().time()
+        if (
+            not force
+            and self._last_face_scan_at is not None
+            and now - self._last_face_scan_at < _FACE_COOLDOWN_SECONDS
+        ):
+            return
+
+        async with self._face_scan_lock:
+            frame = self.deps.camera_worker.get_latest_frame()
+            if frame is None:
+                logger.debug("Face recognition skipped: no frame available")
+                return
+            # Burn the cooldown only AFTER a frame is confirmed (mirrors scene).
+            self._last_face_scan_at = asyncio.get_event_loop().time()
+            try:
+                recognizer = getattr(self.deps, "face_recognizer", None)
+                probe = await asyncio.to_thread(recognizer.embed_largest, frame)
+                if probe is None:
+                    # No face present → nobody to recognize, no cue to offer.
+                    self._latest_face_recognition = None
+                    self._face_unrecognized_present = False
+                    return
+
+                match_set = await asyncio.to_thread(_MEMORY_STORE.get_face_match_set_sync)
+                scored = _FACE_MATCH.score_profiles(probe["embedding"], match_set)
+                d = _FACE_MATCH.decide(scored, high=_FACE_HIGH_THRESHOLD, low=_FACE_LOW_THRESHOLD)
+                eid = getattr(self, "_capture_episode_id", None)
+                tier = d["tier"]
+
+                if tier == "match":
+                    self._face_unrecognized_present = False
+                    await asyncio.to_thread(
+                        _MEMORY_STORE.log_face_sighting_sync,
+                        entity_id=d["entity_id"],
+                        episode_id=eid,
+                        embedding=probe["embedding"],
+                        confidence=d["score"],
+                        source="recognize",
+                    )
+                    await self._tag_identity(d["entity_id"], d["name"])
+                    self._session_recognized_ids.add(d["entity_id"])
+                    self._latest_face_recognition = (
+                        d["entity_id"],
+                        d["name"],
+                        asyncio.get_event_loop().time(),
+                    )
+                    await self.refresh_session_instructions()
+                elif tier == "gray":
+                    pinned = (
+                        await asyncio.to_thread(_SPEAKER_STATE.get_current_speaker)
+                        if _SPEAKER_STATE is not None
+                        else None
+                    )
+                    pinned_id = pinned["id"] if pinned else None
+                    if _FACE_MATCH.corroboration_ok(
+                        d["entity_id"],
+                        explicit_name_entity_id=None,
+                        pinned_entity_id=pinned_id,
+                        session_recognized_ids=self._session_recognized_ids,
+                    ):
+                        self._face_unrecognized_present = False
+                        await asyncio.to_thread(
+                            _MEMORY_STORE.log_face_sighting_sync,
+                            entity_id=d["entity_id"],
+                            episode_id=eid,
+                            embedding=probe["embedding"],
+                            confidence=d["score"],
+                            source="recognize",
+                        )
+                        await self._tag_identity(d["entity_id"], d["name"])
+                        # Deliberately NOT added to _session_recognized_ids: that
+                        # is HIGH-tier only. Promoting a pin-corroborated gray
+                        # accept would let it self-corroborate the next scan.
+                        self._latest_face_recognition = (
+                            d["entity_id"],
+                            d["name"],
+                            asyncio.get_event_loop().time(),
+                        )
+                        await self.refresh_session_instructions()
+                    # else: uncorroborated gray → no-op (no log, pin, or refresh)
+                else:
+                    # Face detected but matched no one: keep the unmatched
+                    # sighting (offline review / later correction) and cue Bemo
+                    # to offer to remember them.
+                    await asyncio.to_thread(
+                        _MEMORY_STORE.log_face_sighting_sync,
+                        entity_id=None,
+                        episode_id=eid,
+                        embedding=probe["embedding"],
+                        confidence=d["score"],
+                        source="recognize",
+                    )
+                    self._face_unrecognized_present = True
+            except Exception:
+                logger.exception("Face recognition failed")
+                return
+
+    async def _tag_identity(self, entity_id: int, name: str) -> None:
+        """Pin the speaker and attribute them to the current episode.
+
+        DRY helper for the match + gray-accept branches. Each step is isolated
+        in its own try/except so a speaker-pin failure doesn't drop the
+        participant merge (or vice-versa).
+        """
+        if _SPEAKER_STATE is not None:
+            try:
+                await asyncio.to_thread(_SPEAKER_STATE.set_current_speaker, entity_id, name)
+            except Exception:
+                logger.exception("set_current_speaker failed during _tag_identity")
+        eid = getattr(self, "_capture_episode_id", None)
+        if _CAPTURE_STORE is not None and eid is not None:
+            try:
+                # Additive union per Part A3 — never set_participants here.
+                await _CAPTURE_STORE.merge_participant(eid, name)
+            except Exception:
+                logger.exception("merge_participant failed during _tag_identity")
 
     async def _resolve_full_instructions(self) -> str:
         """Base instructions plus the dynamic state block."""
@@ -1408,6 +1649,21 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
 
             asyncio.create_task(_startup_scene_scan())
 
+            # Face-ID (Phase 2): fire-and-forget a face scan shortly after the
+            # session opens so Bemo can greet a known face on sight. Same shape
+            # as the scene scan — never blocks session-ready; backfill via the
+            # eventual refresh is acceptable (Decision 4).
+            async def _startup_face_scan() -> None:
+                try:
+                    await asyncio.sleep(2.0)
+                    await self._run_face_recognition()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Startup face scan failed")
+
+            asyncio.create_task(_startup_face_scan())
+
             # Reset the partial-transcript accumulator for each new session
             self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
 
@@ -1533,6 +1789,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
                             continue
+
+                        # Face-ID (Phase 2): a real user turn happened. The
+                        # state block reads this to gate the enrollment cue to
+                        # an active conversant (not the pre-speech startup scan).
+                        self._user_turn_count += 1
 
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None
@@ -1872,6 +2133,9 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         # cooldown gate inside the helper keeps this from running on
         # every idle cycle.
         await self._run_scene_observation()
+        # Face-ID (Phase 2): backfill recognition on idle ticks. Cooldown-gated
+        # internally, so this is cheap when a scan ran recently.
+        await self._run_face_recognition()
         self.is_idle_tool_call = True
         timestamp_msg = (
             f"[Idle time update: {self.format_timestamp()} - "
