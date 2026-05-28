@@ -11,6 +11,7 @@ import sys
 import json
 import asyncio
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
@@ -174,6 +175,24 @@ def _import_outer_stores():
 
 
 _OUTER_STORES = _import_outer_stores()
+
+
+@pytest.mark.skipif(
+    _OUTER_STORES is None, reason="outer-repo tools/ not importable (no _memory_store)"
+)
+def test_real_memory_db_is_isolated_during_tests():
+    """The session isolation fixture keeps tests off the real ~/.bemo/memory.db.
+
+    _read_latest_mood (and peers) import _memory_store DIRECTLY, bypassing the
+    base_realtime _MEMORY_STORE global the conftest neutralizes. Once this
+    integration harness puts tools/ on sys.path that import resolves, so the
+    conftest's _isolate_real_memory_db fixture must redirect DB_PATH away from
+    the developer's real DB. Without that fixture this asserts the real path.
+    """
+    import _memory_store
+
+    real = Path.home() / ".bemo" / "memory.db"
+    assert Path(_memory_store.DB_PATH).resolve() != real.resolve()
 
 
 def _gray_probe() -> np.ndarray:

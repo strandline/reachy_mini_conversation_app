@@ -4,6 +4,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).parents[1].resolve()
 SRC_PATH = PROJECT_ROOT / "src"
@@ -18,3 +20,34 @@ os.environ["REACHY_MINI_SKIP_DOTENV"] = "1"
 os.environ.pop("REACHY_MINI_CUSTOM_PROFILE", None)
 os.environ.pop("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY", None)
 os.environ.pop("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY", None)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_real_memory_db(tmp_path_factory):
+    """Never let any test read or write the developer's real ~/.bemo/memory.db.
+
+    Popping REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY (above) makes the base_realtime
+    store *globals* load as None, but several code paths import _memory_store
+    DIRECTLY (e.g. BaseRealtimeHandler._read_latest_mood). If any test puts the
+    outer-repo tools/ dir on sys.path — the face-ID integration harness in
+    test_face_id.py does, for its temp-DB round-trips — that direct import then
+    succeeds and would otherwise hit the real memory DB, leaking live data into
+    assertions (and risking writes). Redirect DB_PATH to a session-scoped
+    throwaway whenever _memory_store is importable; no-op (and the real DB stays
+    unreachable) when it isn't. Function-scoped fixtures that want their own DB
+    (face_ctx) still monkeypatch DB_PATH on top of this and revert to it.
+    """
+    try:
+        import _memory_store
+    except ImportError:
+        yield
+        return
+    original_path = _memory_store.DB_PATH
+    original_initialized = _memory_store._initialized
+    _memory_store.DB_PATH = tmp_path_factory.mktemp("bemo_isolated") / "memory.db"
+    _memory_store._initialized = False
+    try:
+        yield
+    finally:
+        _memory_store.DB_PATH = original_path
+        _memory_store._initialized = original_initialized
