@@ -436,6 +436,22 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         self._last_scene_scan_at: float | None = None
         self._scene_scan_lock = asyncio.Lock()
 
+        # Realtime face-ID (feat/realtime-face-id Phase 2). Mirrors the scene
+        # cache above. The recognition cache ts uses the SAME clock as
+        # _face_recognition_summary's stale check (asyncio loop time), or the
+        # 600 s stale gate silently breaks.
+        self._latest_face_recognition: tuple[int, str, float] | None = None
+        self._last_face_scan_at: float | None = None
+        self._face_scan_lock = asyncio.Lock()
+        self._session_recognized_ids: set[int] = set()
+        self._face_unrecognized_present: bool = False
+        self._user_turn_count: int = 0
+        # Share the SAME set object with deps so the enroll/correct tools and
+        # the recognizer mutate one gray-zone continuity set. Attached here, by
+        # the set; the connect-path reset clears IN PLACE (never rebinds) so
+        # this identity survives reconnects.
+        self.deps.session_recognized_ids = self._session_recognized_ids
+
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
         """Remove bulky transport-only fields before echoing tool output back to the model."""
@@ -1355,11 +1371,21 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 # set or import failed). Stored as instance attribute so
                 # transcript event handlers below can append turns to it.
                 self._capture_episode_id = None
+                # Face-ID (Phase 2): reset per-session continuity state. The
+                # handler is reused across reconnects, so clear the recognized
+                # set IN PLACE (preserving the deps-shared object identity) and
+                # reset the enrollment-cue flag + user-turn counter.
+                self._session_recognized_ids.clear()
+                self._face_unrecognized_present = False
+                self._user_turn_count = 0
                 if _CAPTURE_STORE is not None:
                     try:
                         self._capture_episode_id = await _CAPTURE_STORE.open_episode([])
                     except Exception:
                         logger.exception("open_episode failed; capture disabled this session")
+                # Re-assert the live episode id onto deps so the enroll/correct
+                # tools log sightings + merge participants against this episode.
+                self.deps.capture_episode_id = self._capture_episode_id
             except Exception:
                 logger.exception("Realtime session.update failed; aborting startup")
                 raise

@@ -6,6 +6,8 @@ fake ``app``/face objects stand in for insightface so these run without the
 package installed and without a webcam.
 """
 
+from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
 
@@ -13,6 +15,8 @@ from reachy_mini_conversation_app.vision.face_id import (
     FaceRecognizer,
     initialize_face_recognizer,
 )
+from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
+from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 
 
 class _FakeFace:
@@ -100,3 +104,30 @@ def test_initialize_face_recognizer_returns_none_without_insightface(monkeypatch
 
     monkeypatch.setattr(FaceRecognizer, "load", _boom)
     assert initialize_face_recognizer() is None
+
+
+# ---------------------------------------------------------------------------
+# Step S — shared ToolDependencies fields + deps-attach wiring
+# ---------------------------------------------------------------------------
+
+
+def test_tool_dependencies_face_fields_default_none():
+    """ToolDependencies gains face_recognizer/capture_episode_id/session_recognized_ids, all None."""
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    assert deps.face_recognizer is None
+    assert deps.capture_episode_id is None
+    assert deps.session_recognized_ids is None
+
+
+@pytest.mark.asyncio
+async def test_handler_shares_session_recognized_ids_with_deps():
+    """The handler attaches its live continuity set to deps BY IDENTITY.
+
+    Pins the shared-object invariant: enroll/correct (Part D) read
+    deps.session_recognized_ids while the recognizer (Part C) mutates
+    self._session_recognized_ids — they must be the same object, and stay so
+    across reconnects (the connect-path reset must clear in place, not rebind).
+    """
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = OpenaiRealtimeHandler(deps)
+    assert handler.deps.session_recognized_ids is handler._session_recognized_ids

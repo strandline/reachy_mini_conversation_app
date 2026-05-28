@@ -67,6 +67,11 @@ class ToolDependencies:
     # so tools (e.g. reflect on mood_snapshot) can request a refresh after
     # changing state that the state block reads. None when no session is live.
     refresh_session_instructions: Any | None = None
+    # Realtime face-ID (feat/realtime-face-id Phase 2). All default None; every
+    # consumer guards for None so non-face sessions are unaffected.
+    face_recognizer: Any | None = None  # FaceRecognizer (vision/face_id.py); Any avoids the type import
+    capture_episode_id: int | None = None  # current open episode; enroll/correct log sightings + merge participants
+    session_recognized_ids: set[int] | None = None  # SHARED with the handler's set (gray-zone continuity)
 
 
 # Tool base class
