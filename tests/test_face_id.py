@@ -758,6 +758,46 @@ async def test_correct_identity_clear_unsets_identity(face_ctx):
 
 
 @pytest.mark.asyncio
+async def test_correct_identity_drops_stale_session_continuity(face_ctx):
+    """Correcting a misgreet removes the wrong entity from session continuity.
+
+    The recognizer's high-tier (mis)match added the wrong entity to
+    session_recognized_ids and pinned it. If correct only ADDS the new entity,
+    a later gray-zone scan can re-corroborate the wrong one via continuity and
+    undo the correction. So the previously-pinned (wrong) entity must be dropped.
+    """
+    ctx = face_ctx
+    wrong = ctx.ms.upsert_entity_sync("Wrongname", kind="person")
+    ctx.ms.log_face_sighting_sync(
+        entity_id=wrong, episode_id=ctx.episode_id, embedding=_onehot(0),
+        confidence=0.9, source="recognize")
+    ctx.ss.set_current_speaker(wrong, "Wrongname")     # mis-greet pinned
+    ctx.handler.deps.session_recognized_ids.add(wrong)  # recognizer's high-match
+    ctx.handler.deps.face_recognizer = None
+
+    await CorrectIdentity()(ctx.handler.deps, name="Maya")
+
+    maya = _entity_by_name(ctx.ms, "Maya")
+    assert wrong not in ctx.handler.deps.session_recognized_ids  # stale dropped
+    assert maya["id"] in ctx.handler.deps.session_recognized_ids  # new present
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_clear_drops_stale_session_continuity(face_ctx):
+    """clear=true also drops the wrong entity from continuity (not just the pin)."""
+    ctx = face_ctx
+    wrong = ctx.ms.upsert_entity_sync("Wrongname", kind="person")
+    ctx.ss.set_current_speaker(wrong, "Wrongname")
+    ctx.handler.deps.session_recognized_ids.add(wrong)
+    ctx.handler.deps.face_recognizer = None
+
+    res = await CorrectIdentity()(ctx.handler.deps, clear=True)
+
+    assert res["cleared"] is True
+    assert wrong not in ctx.handler.deps.session_recognized_ids
+
+
+@pytest.mark.asyncio
 async def test_correct_identity_binds_current_frame_when_recognizer_present(face_ctx):
     """With a recognizer, correct binds the current frame: a correct-sighting + centroid seed."""
     ctx = face_ctx

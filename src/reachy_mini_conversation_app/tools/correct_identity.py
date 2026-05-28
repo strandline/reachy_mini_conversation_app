@@ -85,6 +85,14 @@ class CorrectIdentity(Tool):
             return {"error": "memory store not available"}
         ms, _fm, ss, cs = stores  # _fm unused here (correct resolves by name, not face)
 
+        # Capture the currently-pinned (mis-greeted) entity BEFORE re-pinning.
+        # The recognizer's high-tier match added it to session_recognized_ids;
+        # without dropping it the recognizer could re-corroborate the wrong
+        # identity from "session continuity" on the next gray-zone scan and undo
+        # this correction (true for clear=true too).
+        prev = await asyncio.to_thread(ss.get_current_speaker)
+        prev_id = prev["id"] if prev else None
+
         # Resolve target by NAME — the spoken correction IS ground truth here
         # (intentional asymmetry vs enroll's face-as-anchor; do NOT score_profiles).
         if clear:
@@ -137,7 +145,11 @@ class CorrectIdentity(Tool):
                         ms.seed_face_centroid_sync, new_entity_id, probe["embedding"]
                     )
 
-        # Re-pin (or clear) the current speaker.
+        # Drop the stale (wrong) identity from session continuity first, then
+        # re-pin (or clear). discard() is a no-op when prev_id is None or the
+        # corrected name resolves to the same entity (re-added below).
+        if deps.session_recognized_ids is not None and prev_id is not None:
+            deps.session_recognized_ids.discard(prev_id)
         if new_entity_id is not None:
             await asyncio.to_thread(ss.set_current_speaker, new_entity_id, final_name)
             if deps.session_recognized_ids is not None:
