@@ -261,9 +261,10 @@ class VoiceProfileStore:
           `received_monotonic`, so a walk-away/come-back naturally re-baselines.
         - **Prior mean, not running mean.** We compare the recent window
           against the readings *before* it (history minus the recent window),
-          a sharper change detector than recent-vs-overall. `min_samples=6`
-          with `window=3` guarantees the prior side is itself a mean of >=3
-          readings, not a single noisy observation.
+          a sharper change detector than recent-vs-overall. We require a *full*
+          prior window (`len(prior) >= window`) so the baseline is itself a
+          mean of >=window readings, never a single noisy observation — this
+          guard holds regardless of how `min_samples` is tuned.
 
         `now` is injectable for testing; defaults to `time.monotonic()`.
         """
@@ -280,7 +281,7 @@ class VoiceProfileStore:
             return None
         recent = scored[-window:]
         prior = scored[:-window]
-        if len(recent) < window or not prior:
+        if len(recent) < window or len(prior) < window:
             return None
         recent_mean = sum(v for _, v in recent) / len(recent)
         prior_mean = sum(v for _, v in prior) / len(prior)

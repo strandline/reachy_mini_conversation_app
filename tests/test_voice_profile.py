@@ -73,6 +73,18 @@ def test_trend_none_below_min_samples():
     assert store.valence_trend(now=now) is None
 
 
+def test_trend_requires_full_prior_window():
+    """Prior side must have >= window readings, even if min_samples is lower."""
+    # 1 happy (prior) + 3 sad (recent). min_samples=4 clears the sample gate,
+    # but prior has only 1 reading (< window=3) — a single noisy baseline must
+    # not drive a shift, so no trend fires.
+    now = 1000.0
+    prior = [_profile("happy", 1.0, now - 40)]
+    recent = [_profile("sad", 1.0, now - (10 - i)) for i in range(3)]
+    store = _store_with(prior + recent)
+    assert store.valence_trend(now=now, min_samples=4) is None
+
+
 def test_trend_none_when_stable():
     """A steady emotional register produces no shift."""
     now = 1000.0
