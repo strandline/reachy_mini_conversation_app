@@ -638,7 +638,10 @@ async def test_apply_personality_uses_selected_voice_for_lb_allocated_sessions(m
 
     assert "restarted realtime session" in result.lower()
     session = captured_update["session"]
-    assert session["instructions"] == "new instructions"
+    # Instructions are the base personality text plus the dynamic state block
+    # (conversational-memory injection appended by _resolve_full_instructions),
+    # so assert the selected base is the prefix rather than the whole string.
+    assert session["instructions"].startswith("new instructions")
     assert session["audio"]["output"]["voice"] == "Serena"
 
 

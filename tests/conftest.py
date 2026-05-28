@@ -21,6 +21,21 @@ os.environ.pop("REACHY_MINI_CUSTOM_PROFILE", None)
 os.environ.pop("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY", None)
 os.environ.pop("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY", None)
 
+# Backend-readiness checks read provider credentials straight from the env
+# (config reads GEMINI_API_KEY *or* GOOGLE_API_KEY, plus OPENAI/INWORLD/HF), so
+# a developer's exported keys make "can_proceed_with_<backend>" non-deterministic
+# — a test that deletes GEMINI_API_KEY still sees Gemini "ready" via the
+# GOOGLE_API_KEY fallback. Pop them all so the suite is reproducible regardless
+# of the shell; tests that need a credential set it explicitly via monkeypatch.
+for _cred in (
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "INWORLD_API_KEY",
+    "HF_TOKEN",
+):
+    os.environ.pop(_cred, None)
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_real_memory_db(tmp_path_factory):
