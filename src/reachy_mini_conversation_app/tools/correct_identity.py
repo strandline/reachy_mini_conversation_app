@@ -83,7 +83,7 @@ class CorrectIdentity(Tool):
         stores = _load_stores()
         if stores is None:
             return {"error": "memory store not available"}
-        ms, fm, ss, cs = stores
+        ms, _fm, ss, cs = stores  # _fm unused here (correct resolves by name, not face)
 
         # Resolve target by NAME — the spoken correction IS ground truth here
         # (intentional asymmetry vs enroll's face-as-anchor; do NOT score_profiles).
