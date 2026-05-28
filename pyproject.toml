@@ -49,6 +49,10 @@ local_vision = [
   "transformers==5.3.0",
   "num2words",
 ]
+face_id = [
+  "insightface",
+  "onnxruntime",
+]
 yolo_vision = [
   "ultralytics",
   "supervision",

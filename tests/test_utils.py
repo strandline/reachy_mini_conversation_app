@@ -7,6 +7,7 @@ import pytest
 
 from reachy_mini_conversation_app.utils import (
     CameraVisionInitializationError,
+    initialize_face_recognizer,
     initialize_camera_and_vision,
 )
 
@@ -95,3 +96,35 @@ def test_initialize_camera_and_vision_uses_mediapipe_head_tracker_in_process() -
         initialize_camera_and_vision(args, current_robot)
 
     mock_camera_worker.assert_called_once_with(current_robot, mediapipe_head_tracker)
+
+
+# --- initialize_face_recognizer (Phase 2 face-ID, E1 wiring) -------------
+# Auto-enabled with no flag (Decision 3) and must NEVER block startup
+# (Decision 4) — unlike the --local-vision path it never raises / sys.exits.
+
+_FACTORY = "reachy_mini_conversation_app.vision.face_id.initialize_face_recognizer"
+
+
+def test_initialize_face_recognizer_returns_none_without_camera() -> None:
+    """No camera worker → None (gate on the built worker, not args)."""
+    assert initialize_face_recognizer(argparse.Namespace(), None) is None
+
+
+def test_initialize_face_recognizer_returns_recognizer_when_available() -> None:
+    """Camera present + factory yields a recognizer → that recognizer is returned."""
+    sentinel = MagicMock(name="FaceRecognizer")
+    with patch(_FACTORY, return_value=sentinel):
+        assert initialize_face_recognizer(argparse.Namespace(), MagicMock()) is sentinel
+
+
+def test_initialize_face_recognizer_returns_none_when_insightface_absent() -> None:
+    """Camera present + factory returns None (insightface absent) → None, no raise."""
+    with patch(_FACTORY, return_value=None):
+        assert initialize_face_recognizer(argparse.Namespace(), MagicMock()) is None
+
+
+def test_initialize_face_recognizer_never_raises_on_init_error() -> None:
+    """A factory error degrades to None — regression guard vs the --local-vision raise."""
+    with patch(_FACTORY, side_effect=RuntimeError("model download failed")):
+        # Must NOT raise / sys.exit; face-ID never blocks startup.
+        assert initialize_face_recognizer(argparse.Namespace(), MagicMock()) is None

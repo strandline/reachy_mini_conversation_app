@@ -19,6 +19,7 @@ from reachy_mini_conversation_app.utils import (
     CameraVisionInitializationError,
     parse_args,
     setup_logger,
+    initialize_face_recognizer,
     initialize_camera_and_vision,
     log_connection_troubleshooting,
 )
@@ -151,6 +152,11 @@ def run(
         logger.error("Failed to initialize camera/vision: %s", e)
         sys.exit(1)
 
+    # Realtime face-ID (Phase 2): auto-enabled when a camera is present;
+    # returns None (never raises) when insightface is absent or init fails, so
+    # it stays OUTSIDE the try/except above and never blocks startup.
+    face_recognizer = initialize_face_recognizer(args, camera_worker)
+
     movement_manager = MovementManager(
         current_robot=robot,
         camera_worker=camera_worker,
@@ -165,6 +171,7 @@ def run(
         movement_manager=movement_manager,
         camera_worker=camera_worker,
         vision_processor=vision_processor,
+        face_recognizer=face_recognizer,
         head_wobbler=head_wobbler,
         voice_profile_store=get_voice_profile_store(),
     )

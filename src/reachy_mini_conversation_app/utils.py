@@ -4,7 +4,7 @@ import logging
 import argparse
 import warnings
 import subprocess
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from reachy_mini import ReachyMini
 from reachy_mini_conversation_app.camera_worker import CameraWorker
@@ -113,6 +113,54 @@ def initialize_camera_and_vision(
             )
 
     return camera_worker, vision_processor
+
+
+def initialize_face_recognizer(
+    args: argparse.Namespace, camera_worker: CameraWorker | None
+) -> Any | None:
+    """Build a FaceRecognizer when a camera is present, else None.
+
+    Realtime face-ID (Phase 2) is auto-enabled with NO flag (Decision 3) and
+    must NEVER block startup (Decision 4). So, unlike the ``--local-vision``
+    path (which raises CameraVisionInitializationError → sys.exit), this gates
+    on the already-built ``camera_worker`` and degrades to ``None`` on ANY
+    failure — insightface absent (logged with an install hint) or a
+    model/provider init error (logged as a warning). It never raises.
+
+    Args:
+        args: Parsed CLI args (reserved for future provider overrides).
+        camera_worker: The already-built camera worker, or None when the
+            camera is disabled. Face-ID requires a camera, so None → None.
+
+    Returns:
+        A loaded ``vision.face_id.FaceRecognizer``, or None when face-ID is
+        unavailable for any reason.
+
+    """
+    if camera_worker is None:
+        return None
+    log = logging.getLogger(__name__)
+    try:
+        # Alias on import to disambiguate this gate-wrapper from the vision
+        # module's same-named loader. Deferred so a missing insightface only
+        # matters when a camera is actually present.
+        from reachy_mini_conversation_app.vision.face_id import (
+            initialize_face_recognizer as _load_recognizer,
+        )
+
+        return _load_recognizer()
+    except ImportError:
+        log.info(
+            "Face recognition unavailable; to enable it install the extras: "
+            "pip install '.[face_id]'",
+        )
+        return None
+    except Exception:
+        log.warning(
+            "Face recognizer initialization failed; continuing without face-ID",
+            exc_info=True,
+        )
+        return None
 
 
 def setup_logger(debug: bool) -> logging.Logger:
