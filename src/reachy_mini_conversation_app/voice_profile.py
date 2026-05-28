@@ -37,7 +37,41 @@ __all__ = [
     "VoiceProfileStore",
     "get_voice_profile_store",
     "parse_voice_profile",
+    "EMOTION_VALENCE",
 ]
+
+
+# Slice F (F-live): scalar valence anchors for Inworld emotion labels, used to
+# turn categorical emotion into a -1..1 signal for trend detection. The five
+# doc-pinned anchors are happy +1 / neutral 0 / sad -1 / angry -0.6 / fear -0.7
+# (see docs/emotional-layer-design.md "Tunables"); the rest are clearly-signed
+# synonyms Inworld may emit. Labels NOT in this map are excluded from valence
+# (treated as None) rather than forced to 0 — guessing the sign of an unknown
+# label is worse than ignoring it. This map is a tunable; validate against real
+# Inworld output (design-doc open question #2) before trusting magnitudes.
+EMOTION_VALENCE: dict[str, float] = {
+    # positive
+    "happy": 1.0,
+    "joy": 1.0,
+    "joyful": 1.0,
+    "excited": 0.8,
+    "amused": 0.6,
+    # neutral / relaxed
+    "calm": 0.1,
+    "neutral": 0.0,
+    # negative
+    "tender": -0.3,  # soft / vulnerable register — lean gentle (matches profile)
+    "annoyed": -0.4,
+    "angry": -0.6,
+    "anger": -0.6,
+    "disgust": -0.6,
+    "anxious": -0.6,
+    "fear": -0.7,
+    "fearful": -0.7,
+    "afraid": -0.7,
+    "sad": -1.0,
+    "sadness": -1.0,
+}
 
 
 @dataclass(frozen=True)
@@ -92,6 +126,23 @@ class VoiceProfile:
     def top_accent(self) -> str | None:
         """Return the most-confident accent (BCP-47 locale), or None."""
         return self.accent[0].label if self.accent else None
+
+    def valence(self) -> float | None:
+        """Return a confidence-weighted -1..1 valence, or None if unmappable.
+
+        Maps the top emotion label through `EMOTION_VALENCE` and scales it by
+        the label's confidence, so a low-confidence "sad" reading barely moves
+        the signal while a high-confidence one moves it a lot. Returns None
+        when there's no emotion label or the label isn't in the anchor map
+        (callers should skip None rather than treat it as neutral 0).
+        """
+        if not self.emotion:
+            return None
+        top = self.emotion[0]
+        anchor = EMOTION_VALENCE.get(top.label.lower())
+        if anchor is None:
+            return None
+        return anchor * top.confidence
 
 
 def _parse_label_array(items: Any) -> list[ClassLabel]:
@@ -187,6 +238,70 @@ class VoiceProfileStore:
         """Return a snapshot of recent profiles, oldest first. Safe to iterate."""
         with self._lock:
             return list(self._history)
+
+    def valence_trend(
+        self,
+        *,
+        window: int = 3,
+        min_samples: int = 6,
+        lookback_seconds: float = 600.0,
+        delta: float = 0.35,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Detect a short-window shift in the speaker's emotional valence.
+
+        Compares the mean valence of the last `window` mappable utterances
+        against the mean of the *earlier* utterances within a recent lookback
+        window. Returns a small dict describing the shift when
+        `abs(recent_mean - prior_mean) >= delta`, else None (no notable shift,
+        or not enough data yet).
+
+        Two deliberate deviations from the F-live design-doc tunables:
+
+        - **Baseline scope.** The doc says "vs this session's running mean",
+          but the store is a process-lifetime singleton whose `clear()` is
+          never wired to episode boundaries — so a naive all-history mean
+          would bleed across conversations within one launch. We instead bound
+          the baseline to a recent time window via each profile's
+          `received_monotonic`, so a walk-away/come-back naturally re-baselines.
+        - **Prior mean, not running mean.** We compare the recent window
+          against the readings *before* it (history minus the recent window),
+          a sharper change detector than recent-vs-overall. `min_samples=6`
+          with `window=3` guarantees the prior side is itself a mean of >=3
+          readings, not a single noisy observation.
+
+        `now` is injectable for testing; defaults to `time.monotonic()`.
+        """
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            history = list(self._history)
+        scored = [
+            (p, p.valence())
+            for p in history
+            if now - p.received_monotonic <= lookback_seconds
+        ]
+        scored = [(p, v) for (p, v) in scored if v is not None]
+        if len(scored) < min_samples:
+            return None
+        recent = scored[-window:]
+        prior = scored[:-window]
+        if len(recent) < window or not prior:
+            return None
+        recent_mean = sum(v for _, v in recent) / len(recent)
+        prior_mean = sum(v for _, v in prior) / len(prior)
+        diff = recent_mean - prior_mean
+        if abs(diff) < delta:
+            return None
+        labels = [p.top_emotion() for p, _ in recent if p.top_emotion()]
+        recent_label = max(set(labels), key=labels.count) if labels else None
+        return {
+            "direction": "down" if diff < 0 else "up",
+            "diff": diff,
+            "recent_mean": recent_mean,
+            "prior_mean": prior_mean,
+            "recent_label": recent_label,
+            "samples": len(scored),
+        }
 
     def clear(self) -> None:
         """Forget everything. Useful at session boundaries."""

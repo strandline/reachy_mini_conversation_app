@@ -527,6 +527,52 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             bits.append(style)
         return ", ".join(bits) if bits else None
 
+    def _voice_trend_summary(self) -> str | None:
+        """Format a short-window emotional-shift line for the state block.
+
+        Slice F (F-live): the orthogonal complement to the instantaneous
+        "User's voice right now" line. That line says how they *sound*; this
+        one says how they just *changed* over the last few turns vs. earlier
+        in the conversation. The shift is the signal that turns "she sounds
+        sad" into "you said something that landed badly — back off" — the
+        documented soften/back-off loop. Returns None on non-Inworld backends
+        (empty store) or when no notable shift is detected.
+        """
+        store = self.deps.voice_profile_store
+        if store is None:
+            return None
+        trend = store.valence_trend()
+        if trend is None:
+            return None
+        # Expressive adjective for the dominant recent emotion; falls back to a
+        # direction-generic word when the label is neutral/calm (e.g. a drop
+        # from upbeat to flat has no negative label but is still a cooling).
+        adjectives = {
+            "sad": "sadder", "sadness": "sadder", "tender": "more tender",
+            "annoyed": "more on edge", "angry": "more on edge",
+            "anger": "more on edge", "disgust": "more put-off",
+            "anxious": "more anxious", "fear": "more anxious",
+            "fearful": "more anxious", "afraid": "more anxious",
+            "happy": "brighter", "joy": "brighter", "joyful": "brighter",
+            "excited": "more excited", "amused": "lighter",
+        }
+        label = trend.get("recent_label")
+        adj = adjectives.get(label or "")
+        if trend["direction"] == "down":
+            if adj is None:
+                adj = "flatter"
+            return (
+                f"User's voice has trended {adj} over the last few turns "
+                "(vs. earlier in this chat) — soften, slow down, and ease off "
+                "the topic you just raised."
+            )
+        if adj is None:
+            adj = "brighter"
+        return (
+            f"User's voice has trended {adj} over the last few turns "
+            "(vs. earlier in this chat) — you can match that lift."
+        )
+
     async def _build_state_block(self) -> str:
         """Return the CURRENT STATE block appended to session instructions.
 
@@ -568,6 +614,9 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             )
         if voice_summary is not None:
             lines.append(f"User's voice right now: {voice_summary}")
+        trend_summary = self._voice_trend_summary()
+        if trend_summary is not None:
+            lines.append(trend_summary)
         scene_summary = self._scene_observation_summary()
         if scene_summary is not None:
             lines.append(f"What you can see right now: {scene_summary}")
