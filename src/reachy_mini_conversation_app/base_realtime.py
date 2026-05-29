@@ -366,6 +366,19 @@ _FACE_HIGH_THRESHOLD: Final[float] = _resolve_face_threshold(
 _FACE_LOW_THRESHOLD: Final[float] = _resolve_face_threshold(
     "REACHY_MINI_FACE_LOW_THRESHOLD", 0.30
 )
+# Presence/recency prior (Phase 3): a regular seen recently/often can promote a
+# gray-band match to a confident greet. tau is the minimum decayed presence
+# weight required; half-life/horizon shape the decay (same convention as
+# _memory_store.topic_interests_for). All env-overridable for empirical tuning.
+_FACE_PRIOR_TAU: Final[float] = _resolve_face_threshold(
+    "REACHY_MINI_FACE_PRIOR_TAU", 3.0
+)
+_FACE_PRIOR_HALF_LIFE_DAYS: Final[float] = _resolve_face_threshold(
+    "REACHY_MINI_FACE_PRIOR_HALF_LIFE_DAYS", 3.0
+)
+_FACE_PRESENCE_HORIZON_DAYS: Final[float] = _resolve_face_threshold(
+    "REACHY_MINI_FACE_PRESENCE_HORIZON_DAYS", 90.0
+)
 _SCENE_NOTABLE_PROMPT: Final[str] = (
     "Briefly, in one sentence: what's notable, new, or visually "
     "interesting in this scene? Mention objects, people, clothing, "
@@ -990,7 +1003,62 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                             asyncio.get_event_loop().time(),
                         )
                         await self.refresh_session_instructions()
-                    # else: uncorroborated gray → no-op (no log, pin, or refresh)
+                    else:
+                        # Uncorroborated gray: fall back to the presence/recency
+                        # prior. A regular seen recently/often promotes to a
+                        # GREET-ONLY accept — pin + cache + refresh, but NO
+                        # reinforcing sighting (the prior is standing evidence,
+                        # not per-frame proof THIS frame is them; feeding a gray
+                        # frame on the prior alone would risk centroid drift) and
+                        # NOT added to session continuity (it must not
+                        # self-corroborate later gray scans). A false promotion is
+                        # thus a recoverable verbal misgreet, not gallery
+                        # corruption. The signal query is paid only here, on the
+                        # otherwise-no-op branch — never on the hot match path.
+                        now_wall = time.time()
+                        signals = await asyncio.to_thread(
+                            _MEMORY_STORE.get_presence_signals_sync,
+                            now=now_wall,
+                            horizon_days=_FACE_PRESENCE_HORIZON_DAYS,
+                        )
+                        priors = {
+                            cand_id: _FACE_MATCH.presence_prior(
+                                sig["sightings_ts"],
+                                sig["mentions_ts"],
+                                now=now_wall,
+                                half_life_days=_FACE_PRIOR_HALF_LIFE_DAYS,
+                            )
+                            for cand_id, sig in signals.items()
+                        }
+                        promoted = _FACE_MATCH.decide_with_prior(
+                            scored,
+                            high=_FACE_HIGH_THRESHOLD,
+                            low=_FACE_LOW_THRESHOLD,
+                            priors=priors,
+                            tau=_FACE_PRIOR_TAU,
+                        )
+                        if promoted.get("via") == "prior":
+                            logger.info(
+                                "Face recognition: presence prior promoted "
+                                "gray→greet (entity=%s name=%r score=%.3f "
+                                "prior=%.2f tau=%.2f)",
+                                promoted["entity_id"],
+                                promoted["name"],
+                                promoted["score"],
+                                priors.get(promoted["entity_id"], 0.0),
+                                _FACE_PRIOR_TAU,
+                            )
+                            self._face_unrecognized_present = False
+                            await self._tag_identity(
+                                promoted["entity_id"], promoted["name"]
+                            )
+                            self._latest_face_recognition = (
+                                promoted["entity_id"],
+                                promoted["name"],
+                                asyncio.get_event_loop().time(),
+                            )
+                            await self.refresh_session_instructions()
+                        # else: uncorroborated gray, prior < tau → no-op
                 else:
                     # Face detected but matched no one: keep the unmatched
                     # sighting (offline review / later correction) and cue Bemo

@@ -435,6 +435,116 @@ async def test_run_face_recognition_gray_corroborated_by_pin_accepts(face_ctx):
 
 
 @pytest.mark.asyncio
+async def test_run_face_recognition_gray_promoted_by_presence_prior(face_ctx, monkeypatch):
+    """A gray match for a recent regular is promoted to a greet by the prior.
+
+    The recency/frequency tightening: a regular seen recently whose live face
+    lands in the gray band [LOW, HIGH) is greeted by name even with NO pin and
+    NO session corroboration. The promotion is GREET-ONLY — it pins, attributes,
+    caches, and refreshes, but deliberately does NOT log a reinforcing sighting
+    (a prior is recency evidence, not proof THIS frame is them; feeding it would
+    risk centroid drift) and does NOT join _session_recognized_ids (a
+    prior-promoted accept must not self-corroborate later gray scans).
+    """
+    import reachy_mini_conversation_app.base_realtime as br
+
+    ctx = face_ctx
+    eid = ctx.ms.upsert_entity_sync("Rey", kind="person")
+    ctx.ms.seed_face_centroid_sync(eid, _onehot(0))
+    # One recent sighting → presence_prior ≈ 1.0 for Rey (ts stamped now).
+    ctx.ms.log_face_sighting_sync(
+        entity_id=eid, episode_id=ctx.episode_id,
+        embedding=_onehot(0), confidence=1.0, source="recognize",
+    )
+    monkeypatch.setattr(br, "_FACE_PRIOR_TAU", 0.5)  # 1.0 ≥ 0.5 → promote
+    ctx.ss.clear_current_speaker()  # no pin: the prior alone must carry it
+    _set_probe(ctx, _gray_probe())  # cosine 0.37 → gray band
+
+    sightings_before = len(_all_sightings(ctx.ms))
+    await ctx.handler._run_face_recognition()
+
+    # Greeted: pinned, attributed, cached, cue cleared, refreshed.
+    speaker = ctx.ss.get_current_speaker()
+    assert speaker is not None and speaker["id"] == eid
+    assert "Rey" in _participants(ctx.ms, ctx.episode_id)
+    assert ctx.handler._latest_face_recognition is not None
+    cached_eid, cached_name, _ts = ctx.handler._latest_face_recognition
+    assert (cached_eid, cached_name) == (eid, "Rey")
+    assert ctx.handler._face_unrecognized_present is False
+    ctx.refresh.assert_awaited()
+    # Greet-only: the promotion logs NO reinforcing sighting (no centroid feed).
+    assert len(_all_sightings(ctx.ms)) == sightings_before
+    # Prior-promoted must NOT self-corroborate later scans (HIGH-tier only).
+    assert eid not in ctx.handler._session_recognized_ids
+
+
+@pytest.mark.asyncio
+async def test_run_face_recognition_gray_not_promoted_below_tau(face_ctx, monkeypatch):
+    """The prior gates on tau — below it, a gray match is not promoted.
+
+    Falls back to the ordinary gray path; with no pin/session corroboration that
+    is a pure no-op. Guards the tau gate against a regression that would promote
+    every gray match regardless of presence.
+    """
+    import reachy_mini_conversation_app.base_realtime as br
+
+    ctx = face_ctx
+    eid = ctx.ms.upsert_entity_sync("Rey", kind="person")
+    ctx.ms.seed_face_centroid_sync(eid, _onehot(0))
+    ctx.ms.log_face_sighting_sync(
+        entity_id=eid, episode_id=ctx.episode_id,
+        embedding=_onehot(0), confidence=1.0, source="recognize",
+    )  # presence_prior ≈ 1.0
+    monkeypatch.setattr(br, "_FACE_PRIOR_TAU", 5.0)  # 1.0 < 5.0 → NOT promoted
+    ctx.ss.clear_current_speaker()
+    _set_probe(ctx, _gray_probe())
+
+    sightings_before = len(_all_sightings(ctx.ms))
+    await ctx.handler._run_face_recognition()
+
+    assert ctx.ss.get_current_speaker() is None  # not pinned
+    assert eid not in ctx.handler._session_recognized_ids
+    assert ctx.handler._latest_face_recognition is None
+    assert _participants(ctx.ms, ctx.episode_id) == []
+    assert len(_all_sightings(ctx.ms)) == sightings_before  # pure no-op
+    ctx.refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_face_recognition_gray_corroboration_precedes_prior(face_ctx):
+    """A gray match that is BOTH pin-corroborated and high-prior reinforces.
+
+    Corroboration wins over the prior: the pin is per-frame proof the frame is
+    them, so it is a legitimate exemplar and gets logged (adapting the centroid).
+    The prior only rescues the UNcorroborated gray case; it must not suppress the
+    reinforcement an in-session pin already earns.
+    """
+    ctx = face_ctx
+    eid = ctx.ms.upsert_entity_sync("Maya", kind="person")
+    ctx.ms.seed_face_centroid_sync(eid, _onehot(0))
+    # Five recent sightings → presence_prior ≈ 5 ≥ default tau (3.0): the prior
+    # WOULD promote on its own — so this exercises the corroboration-vs-prior order.
+    for _ in range(5):
+        ctx.ms.log_face_sighting_sync(
+            entity_id=eid, episode_id=ctx.episode_id,
+            embedding=_onehot(0), confidence=1.0, source="recognize",
+        )
+    ctx.ss.set_current_speaker(eid, "Maya")  # pin corroborates the gray candidate
+    _set_probe(ctx, _gray_probe())
+
+    before = len(_all_sightings(ctx.ms))
+    await ctx.handler._run_face_recognition()
+    after = _all_sightings(ctx.ms)
+
+    assert len(after) == before + 1  # corroboration reinforced the gallery
+    assert after[-1]["entity_id"] == eid
+    assert after[-1]["source"] == "recognize"
+    assert ctx.ss.get_current_speaker()["id"] == eid
+    assert eid not in ctx.handler._session_recognized_ids  # gray never session-adds
+    ctx.refresh.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_run_face_recognition_bails_no_recognizer(face_ctx):
     """No recognizer on deps → returns immediately, touches nothing."""
     ctx = face_ctx
