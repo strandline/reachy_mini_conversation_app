@@ -23,11 +23,15 @@ from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
 
 logger = logging.getLogger(__name__)
 
+_FACE_HIGH = float(os.environ.get("REACHY_MINI_FACE_HIGH_THRESHOLD", "0.45"))
 
-def _load_stores() -> tuple[Any, Any, Any, Any] | None:
+
+def _load_stores() -> tuple[Any, Any, Any, Any, Any] | None:
     """Import the outer-repo store modules at call time, or None if unavailable.
 
     Same contract as enroll_face._load_stores (never caches a load-time None).
+    Returns (ms, fm, ss, cs, ir) — ir is _identity_route, for the merge gate's
+    name-consistency check.
     """
     tools_dir = os.environ.get("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
     if tools_dir:
@@ -39,8 +43,9 @@ def _load_stores() -> tuple[Any, Any, Any, Any] | None:
         import _memory_store as ms  # type: ignore[import-not-found]
         import _capture_store as cs  # type: ignore[import-not-found]
         import _speaker_state as ss  # type: ignore[import-not-found]
+        import _identity_route as ir  # type: ignore[import-not-found]
 
-        return ms, fm, ss, cs
+        return ms, fm, ss, cs, ir
     except ImportError:
         return None
 
@@ -57,7 +62,10 @@ class CorrectIdentity(Tool):
     description = (
         "Fix a wrong name after you greeted someone incorrectly and they "
         "corrected you. Pass the correct name; pass clear=true if it turns out "
-        "you do not actually know who they are."
+        "you do not actually know who they are. If this returns "
+        "status='merge_candidate', you already have this person saved twice — "
+        "ask them whether to merge the two records, and only if they agree, call "
+        "this again with the same name and confirm_merge=true."
     )
     parameters_schema = {
         "type": "object",
@@ -70,6 +78,14 @@ class CorrectIdentity(Tool):
                 "type": "boolean",
                 "description": "Set true if you do not actually know who they are.",
             },
+            "confirm_merge": {
+                "type": "boolean",
+                "description": (
+                    "Set true ONLY after a prior call returned "
+                    "status='merge_candidate' and the person agreed to merge "
+                    "their two records into one."
+                ),
+            },
         },
         "required": [],
     }
@@ -78,12 +94,13 @@ class CorrectIdentity(Tool):
         """Relabel this session's sightings to the corrected identity (or clear)."""
         name = (kwargs.get("name") or "").strip()
         clear = bool(kwargs.get("clear"))
+        confirm_merge = bool(kwargs.get("confirm_merge"))
         if not name and not clear:
             return {"error": "provide a name or set clear=true"}
         stores = _load_stores()
         if stores is None:
             return {"error": "memory store not available"}
-        ms, _fm, ss, cs = stores  # _fm unused here (correct resolves by name, not face)
+        ms, fm, ss, cs, ir = stores
 
         # Capture the currently-pinned (mis-greeted) entity BEFORE re-pinning.
         # The recognizer's high-tier match added it to session_recognized_ids;
@@ -92,6 +109,20 @@ class CorrectIdentity(Tool):
         # this correction (true for clear=true too).
         prev = await asyncio.to_thread(ss.get_current_speaker)
         prev_id = prev["id"] if prev else None
+
+        # --- merge gate ---------------------------------------------------
+        # When the correction points at a DIFFERENT existing entity that is
+        # plausibly the same person (name-consistent) and the live face confirms
+        # it (>= HIGH on a faced target, or a faceless text-only dossier), the
+        # two records are a fragment of one identity. Propose a merge first;
+        # only fold on explicit confirm_merge. Anything else falls through to the
+        # plain relabel below — a cross-person misgreet (name-inconsistent) is
+        # never merged, so no cross-person link is asserted.
+        if name and not clear and prev_id is not None:
+            decision = await self._merge_gate(deps, ms, fm, ss, cs, ir,
+                                              prev_id, name, confirm_merge)
+            if decision is not None:
+                return decision
 
         # Resolve target by NAME — the spoken correction IS ground truth here
         # (intentional asymmetry vs enroll's face-as-anchor; do NOT score_profiles).
@@ -168,3 +199,86 @@ class CorrectIdentity(Tool):
             "relabeled": relabeled,
             "cleared": clear,
         }
+
+    async def _merge_gate(
+        self, deps: ToolDependencies, ms: Any, fm: Any, ss: Any, cs: Any, ir: Any,
+        prev_id: int, name: str, confirm_merge: bool,
+    ) -> Dict[str, Any] | None:
+        """Propose or execute a same-person merge, or return None to fall through.
+
+        None → not a merge candidate; the caller does the plain relabel. A merge
+        is only ever proposed for a DIFFERENT existing entity whose name is
+        consistent with the source (so a cross-person misgreet is never merged),
+        confirmed by the live face (>= HIGH on a faced target) or, for a faceless
+        text-only dossier, a light confirm.
+        """
+        target_row = await asyncio.to_thread(ms.resolve_entity_sync, name)
+        if target_row is None or target_row["id"] == prev_id:
+            return None  # a new name, or the same entity → not a merge
+        source = await asyncio.to_thread(ms.get_entity_sync, prev_id)
+        target = await asyncio.to_thread(ms.get_entity_sync, target_row["id"])
+        if source is None or target is None:
+            return None
+        # #5: only merge plausibly-same-person names; otherwise fall through to a
+        # plain relabel so no cross-person identity link is ever asserted.
+        if not ir.names_consistent(
+            source["name"], target["name"],
+            aliases_a=source["aliases"], aliases_b=target["aliases"],
+        ):
+            return None
+        if target["has_face"]:
+            score = await self._live_score_against(deps, fm, ms, target["id"])
+            if score is None or score < _FACE_HIGH:
+                return None
+            faceless = False
+        else:
+            faceless = True  # no second face to compare → light confirm
+
+        if not confirm_merge:
+            summary = await asyncio.to_thread(
+                ms.merge_entities_sync, source["id"], target["id"], dry_run=True)
+            return {
+                "status": "merge_candidate",
+                "source": source["name"],
+                "target": target["name"],
+                "faceless": faceless,
+                "summary": summary,
+            }
+
+        # Confirmed → fold source into target, drop the stale id from continuity,
+        # re-pin the survivor.
+        summary = await asyncio.to_thread(
+            ms.merge_entities_sync, source["id"], target["id"])
+        if deps.session_recognized_ids is not None:
+            deps.session_recognized_ids.discard(source["id"])
+            deps.session_recognized_ids.add(target["id"])
+        await asyncio.to_thread(ss.set_current_speaker, target["id"], target["name"])
+        eid = _episode_id(deps)
+        if eid is not None:
+            await cs.merge_participant(eid, target["name"])
+        if deps.refresh_session_instructions:
+            await deps.refresh_session_instructions()
+        return {"status": "merged", "name": target["name"], "summary": summary}
+
+    async def _live_score_against(
+        self, deps: ToolDependencies, fm: Any, ms: Any, entity_id: int
+    ) -> float | None:
+        """Top cosine of the current frame against `entity_id`'s gallery, or None.
+
+        None when there's no recognizer/camera/frame/face or the entity has no
+        gallery — the caller treats that as "can't confirm" → no merge.
+        """
+        if deps.face_recognizer is None or deps.camera_worker is None:
+            return None
+        frame = deps.camera_worker.get_latest_frame()
+        if frame is None:
+            return None
+        probe = await asyncio.to_thread(deps.face_recognizer.embed_largest, frame)
+        if probe is None:
+            return None
+        match_set = await asyncio.to_thread(ms.get_face_match_set_sync)
+        target_set = [m for m in match_set if m["entity_id"] == entity_id]
+        if not target_set:
+            return None
+        scored = fm.score_profiles(probe["embedding"], target_set)
+        return scored[0]["score"] if scored else None

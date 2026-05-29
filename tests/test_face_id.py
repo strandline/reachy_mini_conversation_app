@@ -915,6 +915,109 @@ async def test_correct_identity_no_episode_degrades(face_ctx):
     assert ctx.ss.get_current_speaker() == {"id": maya["id"], "name": "Maya"}
 
 
+# --- correct_identity merge gate -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_proposes_merge_for_faced_consistent_target(face_ctx):
+    """Name-consistent faced target matched >= HIGH while pinned to a fragment → propose, don't merge."""
+    ctx = face_ctx
+    src = ctx.ms.upsert_entity_sync("Bobby", kind="person")
+    ctx.ms.seed_face_centroid_sync(src, _onehot(1))
+    tgt = ctx.ms.upsert_entity_sync("Bobby Johnson", kind="person")
+    ctx.ms.seed_face_centroid_sync(tgt, _onehot(0))
+    ctx.ss.set_current_speaker(src, "Bobby")        # pinned to the fragment
+    _set_probe(ctx, _onehot(0))                      # live face matches TARGET >= HIGH
+
+    res = await CorrectIdentity()(ctx.handler.deps, name="Bobby Johnson")
+
+    assert res["status"] == "merge_candidate"
+    assert res["source"] == "Bobby"
+    assert res["target"] == "Bobby Johnson"
+    assert "summary" in res
+    # Nothing merged yet — both entities still present, pin unchanged.
+    assert ctx.ms.get_entity_sync(src) is not None
+    assert ctx.ms.get_entity_sync(tgt) is not None
+    assert ctx.ss.get_current_speaker() == {"id": src, "name": "Bobby"}
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_merges_on_confirm(face_ctx):
+    """confirm_merge=true folds the fragment into the target and re-pins to it."""
+    ctx = face_ctx
+    src = ctx.ms.upsert_entity_sync("Bobby", kind="person")
+    ctx.ms.seed_face_centroid_sync(src, _onehot(1))
+    tgt = ctx.ms.upsert_entity_sync("Bobby Johnson", kind="person")
+    ctx.ms.seed_face_centroid_sync(tgt, _onehot(0))
+    ctx.ss.set_current_speaker(src, "Bobby")
+    ctx.handler.deps.session_recognized_ids.add(src)
+    _set_probe(ctx, _onehot(0))
+
+    res = await CorrectIdentity()(ctx.handler.deps, name="Bobby Johnson", confirm_merge=True)
+
+    assert res["status"] == "merged"
+    assert ctx.ms.get_entity_sync(src) is None             # source folded + deleted
+    assert _entity_by_name(ctx.ms, "Bobby") is None
+    assert ctx.ms.resolve_entity_sync("Bobby")["id"] == tgt  # now an alias of target
+    assert ctx.ss.get_current_speaker() == {"id": tgt, "name": "Bobby Johnson"}
+    assert src not in ctx.handler.deps.session_recognized_ids
+    assert tgt in ctx.handler.deps.session_recognized_ids
+    ctx.refresh.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_no_merge_for_inconsistent_name(face_ctx):
+    """Cross-person misgreet (name-inconsistent target) must NOT merge — plain relabel, both intact (#5)."""
+    ctx = face_ctx
+    src = ctx.ms.upsert_entity_sync("Yuki", kind="person")
+    ctx.ms.seed_face_centroid_sync(src, _onehot(1))
+    tgt = ctx.ms.upsert_entity_sync("Bobby Johnson", kind="person")
+    ctx.ms.seed_face_centroid_sync(tgt, _onehot(0))
+    ctx.ss.set_current_speaker(src, "Yuki")
+    _set_probe(ctx, _onehot(0))                      # face matches target >= HIGH, but...
+
+    res = await CorrectIdentity()(ctx.handler.deps, name="Bobby Johnson")
+
+    assert res["status"] == "corrected"             # ...names inconsistent → no merge
+    assert ctx.ms.get_entity_sync(src) is not None  # Yuki NOT destroyed
+    assert ctx.ms.get_entity_sync(tgt) is not None
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_proposes_merge_for_faceless_target(face_ctx):
+    """Faceless name-consistent target → light-confirm merge candidate (no >= HIGH face check)."""
+    ctx = face_ctx
+    src = ctx.ms.upsert_entity_sync("Bobby", kind="person")
+    ctx.ms.seed_face_centroid_sync(src, _onehot(0))
+    tgt = ctx.ms.upsert_entity_sync("Bobby Johnson", kind="person")  # faceless
+    ctx.ss.set_current_speaker(src, "Bobby")
+    _set_probe(ctx, _onehot(0))
+
+    res = await CorrectIdentity()(ctx.handler.deps, name="Bobby Johnson")
+
+    assert res["status"] == "merge_candidate"
+    assert res.get("faceless") is True
+    assert ctx.ms.get_entity_sync(src) is not None
+    assert ctx.ms.get_entity_sync(tgt) is not None
+
+
+@pytest.mark.asyncio
+async def test_correct_identity_no_merge_when_target_below_high(face_ctx):
+    """Faced target only weakly (gray) matched by the live face → no merge proposal; plain relabel."""
+    ctx = face_ctx
+    src = ctx.ms.upsert_entity_sync("Bobby", kind="person")
+    ctx.ms.seed_face_centroid_sync(src, _onehot(2))
+    tgt = ctx.ms.upsert_entity_sync("Bobby Johnson", kind="person")
+    ctx.ms.seed_face_centroid_sync(tgt, _onehot(0))
+    ctx.ss.set_current_speaker(src, "Bobby")
+    _set_probe(ctx, _gray_probe())                   # ~0.37 vs target's e0 → < HIGH
+
+    res = await CorrectIdentity()(ctx.handler.deps, name="Bobby Johnson")
+
+    assert res["status"] == "corrected"             # not merge_candidate
+    assert ctx.ms.get_entity_sync(src) is not None
+
+
 # --- gate ----------------------------------------------------------------
 
 
