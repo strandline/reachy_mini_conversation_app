@@ -100,16 +100,33 @@ class EnrollFace(Tool):
 
         match_set = await asyncio.to_thread(ms.get_face_match_set_sync)
         scored = fm.score_profiles(emb, match_set)
+        all_entities = await asyncio.to_thread(ms.list_all_entities_sync)
         # existing_names must include ALIASES (lowercased): upsert_entity_sync is
         # alias-aware, so a names-only set would let a spoken alias slip through as
         # 'new' and silently collapse two faces onto one aliased entity.
         existing_names = {
             n.lower()
-            for e in await asyncio.to_thread(ms.list_all_entities_sync)
+            for e in all_entities
+            for n in ([e["name"]] + (e.get("aliases") or []))
+        }
+        # faced_names = names/aliases of entities that ALREADY own a face profile.
+        # Only a clash with one of these is a real collision (two distinct faces);
+        # a clash with a FACELESS name (e.g. someone known only from text-only
+        # memory) is reuse_by_name — attach the first face to that existing entity.
+        # WITHOUT this, name_has_face is always False and collision never fires.
+        faced_ids = {m["entity_id"] for m in match_set}
+        faced_names = {
+            n.lower()
+            for e in all_entities
+            if e["id"] in faced_ids
             for n in ([e["name"]] + (e.get("aliases") or []))
         }
         res = fm.resolve_enrollment(
-            scored, spoken_name=name, existing_names=existing_names, high=_FACE_HIGH
+            scored,
+            spoken_name=name,
+            existing_names=existing_names,
+            faced_names=faced_names,
+            high=_FACE_HIGH,
         )
         action = res["action"]
 
@@ -128,7 +145,11 @@ class EnrollFace(Tool):
             if name.lower() != (final_name or "").lower():
                 await asyncio.to_thread(ms.add_alias_sync, final_name, name, kind="person")
             await asyncio.to_thread(ms.seed_face_centroid_sync, entity_id, emb)
-        else:  # 'new'
+        else:  # 'new' or 'reuse_by_name'
+            # upsert_entity_sync is get-or-create: for 'new' it creates a fresh
+            # entity; for 'reuse_by_name' it returns the existing FACELESS entity
+            # (e.g. one known only from text-only memory), unifying the face anchor
+            # with that dossier-bearing record. Either way, seed the first centroid.
             entity_id = await asyncio.to_thread(ms.upsert_entity_sync, name, kind="person")
             await asyncio.to_thread(ms.seed_face_centroid_sync, entity_id, emb)
             final_name = name

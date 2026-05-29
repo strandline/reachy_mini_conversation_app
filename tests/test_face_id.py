@@ -625,11 +625,42 @@ async def test_enroll_face_reuse_known_face_adds_alias_no_duplicate(face_ctx):
 
 
 @pytest.mark.asyncio
-async def test_enroll_face_name_collision_does_not_enroll(face_ctx):
-    """A new face whose spoken name is taken → collision, no entity/sighting/pin."""
+async def test_enroll_face_faceless_existing_name_reuses_by_name(face_ctx):
+    """Cold-start: a face whose spoken name is a FACELESS existing entity (known
+    only from text-only memory) attaches the first face to THAT entity — unifying
+    the face anchor with the dossier-bearing record — rather than false-colliding.
+    """
     ctx = face_ctx
-    # 'Jeff' exists but has NO face centroid → this face won't match (collision).
-    ctx.ms.upsert_entity_sync("Jeff", kind="person")
+    eid = ctx.ms.upsert_entity_sync("Jeff", kind="person")  # known by name, no face
+    _set_probe(ctx, _onehot(5))  # match set empty (no centroids) → face not known
+
+    res = await EnrollFace()(ctx.handler.deps, name="Jeff")
+
+    assert res["status"] == "enrolled"
+    assert res["action"] == "reuse_by_name"
+    assert res["entity_id"] == eid  # attached to the EXISTING entity, no duplicate
+    assert _entity_count(ctx.ms) == 1
+    match_set = ctx.ms.get_face_match_set_sync()
+    assert any(p["entity_id"] == eid for p in match_set)  # face now seeded on Jeff
+    sightings = _all_sightings(ctx.ms)
+    assert len(sightings) == 1
+    assert sightings[0]["source"] == "enroll"
+    assert sightings[0]["entity_id"] == eid
+    assert ctx.ss.get_current_speaker() == {"id": eid, "name": "Jeff"}
+    assert eid in ctx.handler.deps.session_recognized_ids
+    ctx.refresh.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enroll_face_faced_name_collides(face_ctx):
+    """A new, different face whose spoken name ALREADY owns a face → collision,
+    no entity/sighting/pin (never silently collapse two distinct faces).
+    """
+    ctx = face_ctx
+    # 'Jeff' exists AND already has a face centroid; the current face is a
+    # different (orthogonal) one → won't match Jeff → genuine collision.
+    eid = ctx.ms.upsert_entity_sync("Jeff", kind="person")
+    ctx.ms.seed_face_centroid_sync(eid, _onehot(0))
     _set_probe(ctx, _onehot(5))
 
     res = await EnrollFace()(ctx.handler.deps, name="Jeff")
