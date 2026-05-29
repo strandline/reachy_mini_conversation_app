@@ -36,7 +36,7 @@ from reachy_mini_conversation_app.config import (
     get_default_voice_for_backend,
     get_available_voices_for_backend,
 )
-from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
+from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, is_fire_and_forget
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
@@ -1749,7 +1749,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
 
         try:
             self._mark_activity("tool_result_ready")
-            if isinstance(bg_tool.id, str):
+            # Fire-and-forget tools were already answered on dispatch
+            # (bg_tool.acked); sending a second function_call_output for the same
+            # call_id would be a protocol error. The UI message below still
+            # fires so the chat panel shows completion.
+            if isinstance(bg_tool.id, str) and not bg_tool.acked:
                 await self.connection.conversation.item.create(
                     item={
                         "type": "function_call_output",
@@ -1826,8 +1830,10 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                     )
 
             # If this tool call was triggered by an idle signal, don't make the robot speak.
-            # For other tool calls, let the robot reply out loud.
-            if not bg_tool.is_idle_tool_call:
+            # For other tool calls, let the robot reply out loud — unless it was a
+            # fire-and-forget tool already acked + continued on dispatch (acked),
+            # in which case a second response.create here would double-respond.
+            if not bg_tool.is_idle_tool_call and not bg_tool.acked:
                 await self._safe_response_create(
                     response=RealtimeResponseCreateParamsParam(
                         instructions="Use the tool result just returned and answer concisely in speech.",
@@ -2169,6 +2175,16 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                             is_idle_tool_call=self.is_idle_tool_call,
                         )
 
+                        # Mark fire-and-forget tools acked SYNCHRONOUSLY here —
+                        # before the awaits below — so a fast tool that finishes
+                        # during one of them carries acked=True in its completion
+                        # notification and the completion path skips the duplicate
+                        # answer/response. (Setting it inside the ack block below
+                        # would be after an await, leaving that race open.)
+                        fire_and_forget = is_fire_and_forget(tool_name)
+                        if fire_and_forget:
+                            bg_tool.acked = True
+
                         await self.output_queue.put(
                             AdditionalOutputs(
                                 {
@@ -2180,6 +2196,39 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         logger.info(
                             "Started background tool: %s (id=%s, call_id=%s)", tool_name, bg_tool.tool_id, call_id
                         )
+
+                        # Fire-and-forget tools: answer the function_call NOW
+                        # (placeholder output) instead of on completion, so the
+                        # call_id is never left dangling when the next user turn
+                        # arrives. Inworld proxies to chat-completions, which
+                        # rejects a new response while a prior tool_call is
+                        # unanswered ("tool_call_ids did not have response
+                        # messages" → HTTP 400). The real result still runs in
+                        # the background; the model doesn't need it for these
+                        # pure side-effect tools. The completion path checks
+                        # bg_tool.acked and skips the duplicate answer/response.
+                        if fire_and_forget and self.connection is not None:
+                            try:
+                                await self.connection.conversation.item.create(
+                                    item={
+                                        "type": "function_call_output",
+                                        "call_id": call_id,
+                                        "output": json.dumps(
+                                            {"status": "accepted", "note": "running in background"}
+                                        ),
+                                    },
+                                )
+                                if not bg_tool.is_idle_tool_call:
+                                    await self._safe_response_create(
+                                        response=RealtimeResponseCreateParamsParam(
+                                            instructions="Acknowledge briefly and continue the conversation.",
+                                        ),
+                                    )
+                            except self._connection_closed_errors():
+                                logger.warning(
+                                    "Connection closed while acking fire-and-forget tool %s", tool_name
+                                )
+                                self.connection = None
 
                     # server error
                     if event.type == "error":

@@ -81,6 +81,12 @@ class ToolNotification(BaseModel):
     """the error of the tool"""
     error: Optional[str] = None
 
+    """whether the function_call was already answered on dispatch (fire-and-forget
+    ack). When True, the completion path must NOT send a second function_call_output
+    for the same call_id or trigger another response. Lives on the notification (not
+    just BackgroundTool) because the completion handler receives a ToolNotification."""
+    acked: bool = False
+
 
 class BackgroundTool(ToolNotification):
     """Represents a background tool."""
@@ -111,6 +117,7 @@ class BackgroundTool(ToolNotification):
             status=self.status,
             result=self.result,
             error=self.error,
+            acked=self.acked,
         )
 
 

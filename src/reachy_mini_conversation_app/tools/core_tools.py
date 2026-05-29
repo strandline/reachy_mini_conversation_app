@@ -88,6 +88,16 @@ class Tool(abc.ABC):
     description: str
     parameters_schema: Dict[str, Any]
 
+    # When True, the tool is a pure side-effect whose result the model does not
+    # need (memory writes, identity edits). The realtime loop answers its
+    # function_call immediately on dispatch (a placeholder function_call_output)
+    # so the call_id is never left dangling when the next user turn arrives —
+    # Inworld proxies to chat-completions, which rejects a new response while a
+    # prior tool_call is unanswered. Default False = result-bearing (the model
+    # waits for the real result); leave it False unless certain (a placebo ack
+    # on a result-bearing tool would corrupt the model's use of the result).
+    fire_and_forget: bool = False
+
     def spec(self) -> Dict[str, Any]:
         """Return the function spec for LLM consumption."""
         return {
@@ -294,6 +304,18 @@ _initialize_tools()
 def get_tool_specs(exclusion_list: list[str] = []) -> list[Dict[str, Any]]:
     """Get tool specs, optionally excluding some tools."""
     return [spec for spec in ALL_TOOL_SPECS if spec.get("name") not in exclusion_list]
+
+
+def is_fire_and_forget(tool_name: str) -> bool:
+    """Whether a tool is a pure side-effect whose result the model doesn't need.
+
+    Used by the realtime loop to decide whether to answer the function_call
+    immediately on dispatch (see Tool.fire_and_forget). Unknown names → False
+    (safe default: treat as result-bearing, preserving the current wait-for-
+    result behavior).
+    """
+    tool = ALL_TOOLS.get(tool_name)
+    return bool(tool is not None and getattr(tool, "fire_and_forget", False))
 
 
 def get_active_tool_specs(deps: ToolDependencies) -> list[Dict[str, Any]]:

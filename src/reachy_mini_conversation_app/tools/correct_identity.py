@@ -59,6 +59,7 @@ class CorrectIdentity(Tool):
     """Fix a wrong name after a misgreet; resolves by the spoken name."""
 
     name = "correct_identity"
+    fire_and_forget = True  # side-effect write; model doesn't need the result
     description = (
         "Fix a wrong name after you greeted someone incorrectly and they "
         "corrected you. Pass the correct name; pass clear=true if it turns out "

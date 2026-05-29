@@ -61,6 +61,7 @@ class EnrollFace(Tool):
     """Remember the face of the person Bemo is talking with (consent-gated)."""
 
     name = "enroll_face"
+    fire_and_forget = True  # side-effect write; model doesn't need the result
     description = (
         "Remember the face of the person you are talking with, after they have "
         "agreed, so you recognize them next time. Pass the name they gave you."
