@@ -162,26 +162,34 @@ _FACE_MATCH = _load_face_match()
 # affinity_update is omitted from both — it's consolidator history, not
 # live context.
 _STEERING_RENDER = (
-    ("interaction_cue",  "Cues"),
-    ("caution",          "Handle carefully"),
+    ("interaction_cue", "Cues", 2),
+    ("caution", "Handle carefully", 1),
 )
 _SHAREABLE_RENDER = (
-    ("memorable_moment", "Shared history"),
+    ("memorable_moment", "Shared history", 1),
 )
 
 
 def _render_affective_group(
     affective: dict[str, list[dict[str, Any]]],
-    render_spec: tuple[tuple[str, str], ...],
-    max_per_kind: int,
+    render_spec: tuple[tuple[str, str, int], ...],
 ) -> list[str]:
-    """Render one trust tier's notes as 'Label: a; b; c' lines."""
+    """Render one trust tier's notes as 'Label: a; b' lines, per-kind capped.
+
+    Each spec entry carries its own cap (memory-tiering Decision 1b: ≤2 cues,
+    ≤1 handle-carefully, ≤1 shared-history) so the strongest steering stays while
+    the block shrinks — the rest remains in the dossier (on-demand). The env var
+    REACHY_MINI_REL_MAX_PER_KIND, if set, overrides every cap (escape hatch).
+    Notes arrive newest-first (get_affective_notes_sync ORDER BY created_at DESC),
+    so the cap keeps the most recent.
+    """
     out: list[str] = []
-    for kind, label in render_spec:
+    for kind, label, cap in render_spec:
         notes = affective.get(kind, [])
         if not notes:
             continue
-        rendered = "; ".join(n["content"] for n in notes[:max_per_kind])
+        eff = cap if _REL_MAX_PER_KIND_OVERRIDE is None else _REL_MAX_PER_KIND_OVERRIDE
+        rendered = "; ".join(n["content"] for n in notes[:eff])
         out.append(f"{label}: {rendered}")
     return out
 
@@ -189,8 +197,6 @@ def _render_affective_group(
 def _format_relationship_context(
     name: str,
     affective: dict[str, list[dict[str, Any]]],
-    *,
-    max_per_kind: int = 3,
 ) -> str | None:
     """Render Bemo's affective notes about the current speaker.
 
@@ -203,9 +209,7 @@ def _format_relationship_context(
         return None
     lines = [f"--- RELATIONSHIP CONTEXT: {name} ---"]
 
-    steering = _render_affective_group(
-        affective, _STEERING_RENDER, max_per_kind
-    )
+    steering = _render_affective_group(affective, _STEERING_RENDER)
     if steering:
         lines.append(
             "(Steering only — act on these to shape your tone and choices. "
@@ -213,9 +217,7 @@ def _format_relationship_context(
         )
         lines.extend(steering)
 
-    shareable = _render_affective_group(
-        affective, _SHAREABLE_RENDER, max_per_kind
-    )
+    shareable = _render_affective_group(affective, _SHAREABLE_RENDER)
     if shareable:
         lines.append(
             "(Shared history — yours to bring up warmly when it fits. "
@@ -226,6 +228,29 @@ def _format_relationship_context(
     # Only the header rendered → nothing useful; omit the block.
     if len(lines) == 1:
         return None
+    return "\n".join(lines)
+
+
+def _format_stm_buffer(buf: dict[str, Any]) -> str | None:
+    """Render the raw-tail short-term buffer (memory-tiering Layer 1).
+
+    The verbatim tail of a just-ended, not-yet-enriched conversation, so a
+    back-to-back chat isn't amnesic. Explicitly transient: pick up naturally,
+    don't recap it back. Returns None when the buffer is empty (the common case
+    once the enricher has caught up — then the `Recently:` recap represents it).
+    """
+    turns = buf.get("turns") or []
+    if not turns:
+        return None
+    lines = [
+        "Just before this (moments ago, not yet in long-term memory) — "
+        "pick up naturally, don't recap it back:"
+    ]
+    if buf.get("omitted_count"):
+        lines.append("  … (earlier turns omitted)")
+    who = {"user": "them", "assistant": "you"}
+    for t in turns:
+        lines.append(f"  {who.get(t['role'], t['role'])}: {t['content']}")
     return "\n".join(lines)
 
 
@@ -378,6 +403,36 @@ _FACE_PRIOR_HALF_LIFE_DAYS: Final[float] = _resolve_face_threshold(
 )
 _FACE_PRESENCE_HORIZON_DAYS: Final[float] = _resolve_face_threshold(
     "REACHY_MINI_FACE_PRESENCE_HORIZON_DAYS", 90.0
+)
+
+
+def _resolve_optional_int(name: str) -> Optional[int]:
+    """Read an optional int env var; None when unset or unparseable."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; ignoring", name, raw)
+        return None
+
+
+# Raw-tail short-term-memory buffer (memory-tiering Layer 1): bridges the gap
+# between a conversation ending and the enricher consolidating it. Env-tunable.
+_STM_MAX_EPISODES: Final[int] = int(
+    _resolve_face_threshold("REACHY_MINI_STM_MAX_EPISODES", 1.0)
+)
+_STM_MAX_TURNS: Final[int] = int(
+    _resolve_face_threshold("REACHY_MINI_STM_MAX_TURNS", 10.0)
+)
+_STM_MAX_AGE_HOURS: Final[float] = _resolve_face_threshold(
+    "REACHY_MINI_STM_MAX_AGE_HOURS", 2.0
+)
+# Relationship-context per-kind cap escape hatch: if set, overrides ALL caps
+# (e.g. =99 restores the old fuller context if Bemo reads flatter).
+_REL_MAX_PER_KIND_OVERRIDE: Final[Optional[int]] = _resolve_optional_int(
+    "REACHY_MINI_REL_MAX_PER_KIND"
 )
 _SCENE_NOTABLE_PROMPT: Final[str] = (
     "Briefly, in one sentence: what's notable, new, or visually "
@@ -783,6 +838,25 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         lines.append(f"Recently: {summary}{vibe_tail}")
             except Exception:
                 logger.exception("recent_episode_summaries failed")
+            # Raw-tail STM buffer (Layer 1): the verbatim tail of a just-ended,
+            # not-yet-enriched conversation, so a back-to-back chat isn't amnesic.
+            # Self-limiting — empty once the episode is enriched (the Recently:
+            # line above then represents it). The open episode is excluded (it's
+            # already in the live context).
+            try:
+                buf = await asyncio.to_thread(
+                    _CAPTURE_STORE.recent_unenriched_turns,
+                    now=time.time(),
+                    exclude_episode_id=getattr(self, "_capture_episode_id", None),
+                    max_episodes=_STM_MAX_EPISODES,
+                    max_turns=_STM_MAX_TURNS,
+                    max_age_hours=_STM_MAX_AGE_HOURS,
+                )
+                stm = _format_stm_buffer(buf)
+                if stm:
+                    lines.append(stm)
+            except Exception:
+                logger.exception("stm buffer build failed")
             try:
                 patterns = await asyncio.to_thread(
                     _CAPTURE_STORE.recent_patterns, min_count=5, days=7

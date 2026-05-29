@@ -1156,3 +1156,91 @@ def test_face_tools_gated_on_recognizer():
         assert "correct_identity" not in names_without
     finally:
         ct.ALL_TOOLS, ct.ALL_TOOL_SPECS = orig_tools, orig_specs
+
+
+# --- Layer 1: raw-tail STM buffer + relationship-context cap (memory-tiering) ---
+
+
+def _stm_set_summary(ms, eid, summary):
+    conn = ms._connect()
+    try:
+        conn.execute("UPDATE episodes SET summary = ? WHERE id = ?", (summary, eid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_affective(ms, entity_id, kind, contents):
+    import time
+    conn = ms._connect()
+    try:
+        for i, c in enumerate(contents):
+            conn.execute(
+                "INSERT INTO self_notes (kind, content, created_at, about_entity_id) "
+                "VALUES (?, ?, ?, ?)",
+                (kind, c, time.time() + i, entity_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_state_block_includes_stm_buffer_for_unenriched_prior(face_ctx):
+    """A closed-but-unenriched prior episode surfaces as the raw-tail buffer."""
+    ctx = face_ctx
+    prior = await ctx.cs.open_episode(["Jason"])
+    await ctx.cs.append_turn(prior, "user", "we were on about octopuses")
+    await ctx.cs.append_turn(prior, "assistant", "three hearts, remember")
+    ctx.cs.close_episode_sync(prior)  # closed, summary NULL → unenriched
+
+    block = await ctx.handler._build_state_block()
+
+    assert "not yet in long-term memory" in block
+    assert "octopuses" in block
+
+
+@pytest.mark.asyncio
+async def test_state_block_stm_buffer_drops_enriched_episode(face_ctx):
+    """Once the prior episode is enriched, its raw turns leave the buffer."""
+    ctx = face_ctx
+    prior = await ctx.cs.open_episode(["Jason"])
+    await ctx.cs.append_turn(prior, "user", "topic znordle")
+    ctx.cs.close_episode_sync(prior)
+    _stm_set_summary(ctx.ms, prior, "An enriched recap.")
+
+    block = await ctx.handler._build_state_block()
+
+    assert "znordle" not in block
+
+
+@pytest.mark.asyncio
+async def test_state_block_stm_buffer_excludes_open_episode(face_ctx):
+    """The currently-open episode is the working tier already — never buffered."""
+    ctx = face_ctx
+    await ctx.cs.append_turn(ctx.episode_id, "user", "live ongoing chatter")
+
+    block = await ctx.handler._build_state_block()
+
+    assert "live ongoing chatter" not in block
+
+
+@pytest.mark.asyncio
+async def test_relationship_context_caps_per_kind(face_ctx):
+    """Slim block: relationship context caps cues to 2, caution and shared to 1."""
+    ctx = face_ctx
+    jid = ctx.ms.upsert_entity_sync("Jason", kind="person")
+    _seed_affective(ctx.ms, jid, "interaction_cue", ["cueA", "cueB", "cueC"])
+    _seed_affective(ctx.ms, jid, "caution", ["careA", "careB"])
+    _seed_affective(ctx.ms, jid, "memorable_moment", ["memA", "memB"])
+    ctx.ss.set_current_speaker(jid, "Jason")
+
+    block = await ctx.handler._build_state_block()
+    lines = block.split("\n")
+    cues = next(line for line in lines if line.startswith("Cues:"))
+    care = next(line for line in lines if line.startswith("Handle carefully:"))
+    shared = next(line for line in lines if line.startswith("Shared history:"))
+
+    assert len(cues.split("; ")) == 2     # ≤2 cues
+    assert len(care.split("; ")) == 1     # ≤1 caution
+    assert len(shared.split("; ")) == 1   # ≤1 shared-history
