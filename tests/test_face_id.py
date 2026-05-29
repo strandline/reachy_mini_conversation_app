@@ -1349,7 +1349,7 @@ async def test_state_block_event_ledger_recently_passed_framing(face_ctx):
         title="the conference", starts_on=yesterday, ends_on=yesterday, about_entity_id=jid
     )
     block = await ctx.handler._build_state_block()
-    assert "Recently — ask how it went" in block
+    assert "Just wrapped for them" in block
     assert "the conference" in block
 
 
@@ -1386,4 +1386,4 @@ async def test_state_block_event_ledger_absent_when_nothing_salient(face_ctx):
     _recognize_person(ctx, "Jason")
     block = await ctx.handler._build_state_block()
     assert "Coming up" not in block
-    assert "Recently — ask how it went" not in block
+    assert "Just wrapped for them" not in block

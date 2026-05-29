@@ -313,10 +313,17 @@ def _format_event_ledger(events: list[dict[str, Any]], *, today: date) -> str | 
         (recently if status == "passed" else coming).append(line)
     out = [f"Today: {today.isoformat()}"]
     if coming:
-        out.append("Coming up — ask what they're looking forward to / how prep is going:")
+        out.append(
+            "Coming up for them (you already know these — don't ask what they are or "
+            "just echo them back; open a related thread around it: prep, packing, the "
+            'people or place involved, "do you have what you need?"):'
+        )
         out.extend(coming)
     if recently:
-        out.append("Recently — ask how it went, then let it rest:")
+        out.append(
+            "Just wrapped for them (you know these happened — follow up on a detail "
+            'around it, not the whole thing; a warm "how\'d it go?" once):'
+        )
         out.extend(recently)
     if len(out) == 1:  # only the date line — nothing worth saying
         return None
