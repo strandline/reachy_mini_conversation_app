@@ -845,20 +845,30 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             # Self-limiting — empty once the episode is enriched (the Recently:
             # line above then represents it). The open episode is excluded (it's
             # already in the live context).
-            try:
-                buf = await asyncio.to_thread(
-                    _CAPTURE_STORE.recent_unenriched_turns,
-                    now=time.time(),
-                    exclude_episode_id=getattr(self, "_capture_episode_id", None),
-                    max_episodes=_STM_MAX_EPISODES,
-                    max_turns=_STM_MAX_TURNS,
-                    max_age_hours=_STM_MAX_AGE_HOURS,
-                )
-                stm = _format_stm_buffer(buf)
-                if stm:
-                    lines.append(stm)
-            except Exception:
-                logger.exception("stm buffer build failed")
+            #
+            # PRIVACY (PR #17 P1): the buffer replays RAW turns, so it is gated on
+            # LIVE face recognition (face_name above) — not the 20-min speaker pin,
+            # which outlives the session and would leak Jason's tail to an
+            # unenrolled back-to-back visitor. Surfaced only when the person in
+            # frame was a participant of the buffered episode; suppressed when no
+            # face is recognized (unknown / absent / voice-only) so one person's
+            # transcript never reaches the next.
+            if face_name is not None:
+                try:
+                    buf = await asyncio.to_thread(
+                        _CAPTURE_STORE.recent_unenriched_turns,
+                        now=time.time(),
+                        exclude_episode_id=getattr(self, "_capture_episode_id", None),
+                        max_episodes=_STM_MAX_EPISODES,
+                        max_turns=_STM_MAX_TURNS,
+                        max_age_hours=_STM_MAX_AGE_HOURS,
+                        participant=face_name,
+                    )
+                    stm = _format_stm_buffer(buf)
+                    if stm:
+                        lines.append(stm)
+                except Exception:
+                    logger.exception("stm buffer build failed")
             try:
                 patterns = await asyncio.to_thread(
                     _CAPTURE_STORE.recent_patterns, min_count=5, days=7

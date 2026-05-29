@@ -1185,14 +1185,22 @@ def _seed_affective(ms, entity_id, kind, contents):
         conn.close()
 
 
+def _stm_recognize(ctx, name, entity_id=1):
+    """Simulate a fresh live face recognition of `name` (the STM privacy gate)."""
+    ctx.handler._latest_face_recognition = (
+        entity_id, name, asyncio.get_event_loop().time()
+    )
+
+
 @pytest.mark.asyncio
 async def test_state_block_includes_stm_buffer_for_unenriched_prior(face_ctx):
-    """A closed-but-unenriched prior episode surfaces as the raw-tail buffer."""
+    """A prior episode surfaces only when the recognized face was a participant."""
     ctx = face_ctx
     prior = await ctx.cs.open_episode(["Jason"])
     await ctx.cs.append_turn(prior, "user", "we were on about octopuses")
     await ctx.cs.append_turn(prior, "assistant", "three hearts, remember")
     ctx.cs.close_episode_sync(prior)  # closed, summary NULL → unenriched
+    _stm_recognize(ctx, "Jason")
 
     block = await ctx.handler._build_state_block()
 
@@ -1202,12 +1210,13 @@ async def test_state_block_includes_stm_buffer_for_unenriched_prior(face_ctx):
 
 @pytest.mark.asyncio
 async def test_state_block_stm_buffer_drops_enriched_episode(face_ctx):
-    """Once the prior episode is enriched, its raw turns leave the buffer."""
+    """An enriched prior episode's raw turns leave the buffer (face matches)."""
     ctx = face_ctx
     prior = await ctx.cs.open_episode(["Jason"])
     await ctx.cs.append_turn(prior, "user", "topic znordle")
     ctx.cs.close_episode_sync(prior)
     _stm_set_summary(ctx.ms, prior, "An enriched recap.")
+    _stm_recognize(ctx, "Jason")
 
     block = await ctx.handler._build_state_block()
 
@@ -1216,13 +1225,45 @@ async def test_state_block_stm_buffer_drops_enriched_episode(face_ctx):
 
 @pytest.mark.asyncio
 async def test_state_block_stm_buffer_excludes_open_episode(face_ctx):
-    """The currently-open episode is the working tier already — never buffered."""
+    """The currently-open episode is never buffered, even with a matching face."""
     ctx = face_ctx
+    await ctx.cs.merge_participant(ctx.episode_id, "Jason")
     await ctx.cs.append_turn(ctx.episode_id, "user", "live ongoing chatter")
+    _stm_recognize(ctx, "Jason")
 
     block = await ctx.handler._build_state_block()
 
     assert "live ongoing chatter" not in block
+
+
+@pytest.mark.asyncio
+async def test_state_block_stm_buffer_absent_when_face_is_different_person(face_ctx):
+    """PR #17 P1: a back-to-back visitor never sees the prior person's raw turns."""
+    ctx = face_ctx
+    prior = await ctx.cs.open_episode(["Jason"])
+    await ctx.cs.append_turn(prior, "user", "Jason's private octopus secret")
+    ctx.cs.close_episode_sync(prior)
+    _stm_recognize(ctx, "Amanda", entity_id=2)
+
+    block = await ctx.handler._build_state_block()
+
+    assert "octopus secret" not in block
+    assert "not yet in long-term memory" not in block
+
+
+@pytest.mark.asyncio
+async def test_state_block_stm_buffer_absent_when_no_face_recognized(face_ctx):
+    """Fail closed: no recognized face → suppress the raw-tail buffer entirely."""
+    ctx = face_ctx
+    prior = await ctx.cs.open_episode(["Jason"])
+    await ctx.cs.append_turn(prior, "user", "Jason's private octopus secret")
+    ctx.cs.close_episode_sync(prior)
+    ctx.handler._latest_face_recognition = None  # nobody recognized
+
+    block = await ctx.handler._build_state_block()
+
+    assert "octopus secret" not in block
+    assert "not yet in long-term memory" not in block
 
 
 @pytest.mark.asyncio
