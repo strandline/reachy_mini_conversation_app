@@ -11,7 +11,7 @@ import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Final, Tuple, ClassVar, Optional
-from datetime import datetime
+from datetime import date, datetime
 
 import numpy as np
 import gradio as gr
@@ -99,6 +99,29 @@ def _load_memory_store() -> Any:
 
 
 _MEMORY_STORE = _load_memory_store()
+
+
+def _load_event_store() -> Any:
+    """Locate and import bemo-reachy's _event_store, or return None.
+
+    C1 conversational-interest: the dated event ledger lives in the workspace's
+    tools/ dir. Same path-discovery pattern as _load_capture_store; the state
+    block omits the event section when this returns None.
+    """
+    tools_dir = os.environ.get("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
+    if not tools_dir:
+        return None
+    tools_dir = os.path.abspath(os.path.expanduser(tools_dir))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import _event_store  # type: ignore[import-not-found]
+        return _event_store
+    except ImportError:
+        return None
+
+
+_EVENT_STORE = _load_event_store()
 
 
 def _load_speaker_state() -> Any:
@@ -254,6 +277,50 @@ def _format_stm_buffer(buf: dict[str, Any]) -> str | None:
     for t in turns:
         lines.append(f"  {who.get(t['role'], t['role'])}: {t['content']}")
     return "\n".join(lines)
+
+
+def _event_label(ev: dict[str, Any]) -> str:
+    """Return a short event line: title + a date hint (original phrasing if kept)."""
+    title = (ev.get("title") or "something").strip()
+    phrasing = (ev.get("original_phrasing") or "").strip()
+    if phrasing:
+        return f"{title} ({phrasing})"
+    start = ev.get("starts_on")
+    if not start:
+        return title
+    end = ev.get("ends_on")
+    if end and end != start:
+        return f"{title} ({start} – {end})"
+    return f"{title} ({start})"
+
+
+def _format_event_ledger(events: list[dict[str, Any]], *, today: date) -> str | None:
+    """Render the dated event ledger (C1): forward/recently buckets, never a verdict.
+
+    Cued for a natural follow-up; returns None when there's nothing salient. Status
+    is recomputed per event so the grouping tracks `today`; selection + cap already
+    happened in `_event_store.salient_events`.
+    """
+    if not events or _EVENT_STORE is None:
+        return None
+    coming: list[str] = []
+    recently: list[str] = []
+    for ev in events:
+        status = _EVENT_STORE.event_status(
+            ev, today=today.isoformat(), recent_window_days=_EVENT_RECENT_WINDOW_DAYS
+        )
+        line = f"  • {_event_label(ev)}"
+        (recently if status == "passed" else coming).append(line)
+    out = [f"Today: {today.isoformat()}"]
+    if coming:
+        out.append("Coming up — ask what they're looking forward to / how prep is going:")
+        out.extend(coming)
+    if recently:
+        out.append("Recently — ask how it went, then let it rest:")
+        out.extend(recently)
+    if len(out) == 1:  # only the date line — nothing worth saying
+        return None
+    return "\n".join(out)
 
 
 _KIND_PLURALS = {
@@ -430,6 +497,15 @@ _STM_MAX_TURNS: Final[int] = int(
 )
 _STM_MAX_AGE_HOURS: Final[float] = _resolve_face_threshold(
     "REACHY_MINI_STM_MAX_AGE_HOURS", 2.0
+)
+# C1 event ledger (docs/conversational-interest-design.md): how many events to
+# surface per build, and the "how did it go?" window before a passed event
+# stops surfacing. Env-tunable.
+_EVENT_LEDGER_CAP: Final[int] = int(
+    _resolve_face_threshold("REACHY_MINI_EVENT_LEDGER_CAP", 2.0)
+)
+_EVENT_RECENT_WINDOW_DAYS: Final[int] = int(
+    _resolve_face_threshold("REACHY_MINI_EVENT_RECENT_WINDOW_DAYS", 7.0)
 )
 # Relationship-context per-kind cap escape hatch: if set, overrides ALL caps
 # (e.g. =99 restores the old fuller context if Bemo reads flatter).
@@ -825,6 +901,31 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         lines.append(rel_block)
             except Exception:
                 logger.exception("relationship context build failed")
+
+        # C1 event ledger: what's coming up / just happened for the recognized
+        # speaker. Speaker-scoped like the STM buffer — the face cache carries the
+        # entity_id, freshness-gated via _face_recognition_summary; an unknown face
+        # sees only shared/unattributed events. Forward-looking openers, distinct
+        # from the retrospective Recently: recap below.
+        if _EVENT_STORE is not None:
+            try:
+                today_d = date.today()
+                speaker_eid: int | None = None
+                if self._face_recognition_summary() is not None:
+                    rec = self._latest_face_recognition
+                    speaker_eid = rec[0] if rec else None
+                salient = await asyncio.to_thread(
+                    _EVENT_STORE.salient_events,
+                    today=today_d.isoformat(),
+                    speaker_entity_id=speaker_eid,
+                    cap=_EVENT_LEDGER_CAP,
+                    recent_window_days=_EVENT_RECENT_WINDOW_DAYS,
+                )
+                ledger = _format_event_ledger(salient, today=today_d)
+                if ledger:
+                    lines.append(ledger)
+            except Exception:
+                logger.exception("event ledger build failed")
 
         # Phase 1: prior-episode recap + cross-session anti-pattern hint.
         if _CAPTURE_STORE is not None:
