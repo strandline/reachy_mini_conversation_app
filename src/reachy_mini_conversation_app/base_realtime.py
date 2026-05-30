@@ -176,6 +176,36 @@ def _load_face_match() -> Any:
 _FACE_MATCH = _load_face_match()
 
 
+def _load_subconscious() -> Any:
+    """Locate and import bemo-reachy's _subconscious, or return None.
+
+    Second-brain L2 (Subconscious v0): the transcript-watcher's retrieval/
+    render logic lives in the workspace's tools/ dir. Same path-discovery
+    pattern as _load_event_store; the watcher no-ops when this returns None,
+    so a standalone conv-app checkout is unaffected.
+    """
+    tools_dir = os.environ.get("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
+    if not tools_dir:
+        return None
+    tools_dir = os.path.abspath(os.path.expanduser(tools_dir))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import _subconscious  # type: ignore[import-not-found]
+        return _subconscious
+    except ImportError:
+        return None
+
+
+_SUBCONSCIOUS = _load_subconscious()
+
+# Subconscious v0 cadence: run the watcher every Nth user turn (the forced
+# one-beat lag makes per-turn pointless; see second-brain-architecture.md:181).
+_SUBCONSCIOUS_EVERY_N_TURNS = int(
+    os.environ.get("REACHY_MINI_SUBCONSCIOUS_EVERY_N", "3")
+)
+
+
 # Slice D: affective self_note kinds split into two trust tiers.
 #   STEERING — tone/handling metadata Bemo acts on but must NEVER speak
 #     ("don't recite that you're being warm because he's your creator").
@@ -688,6 +718,8 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         self._session_recognized_ids: set[int] = set()
         self._face_unrecognized_present: bool = False
         self._user_turn_count: int = 0
+        # Subconscious v0: last user transcript, read by the watcher.
+        self._last_user_transcript: str | None = None
         # Share the SAME set object with deps so the enroll/correct tools and
         # the recognizer mutate one gray-zone continuity set. Attached here, by
         # the set; the connect-path reset clears IN PLACE (never rebinds) so
