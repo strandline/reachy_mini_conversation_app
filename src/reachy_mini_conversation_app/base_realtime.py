@@ -2599,3 +2599,27 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             },
         )
         await self._safe_response_create()
+
+    async def inject_passive_item(self, text: str) -> None:
+        """Inject a passive context item (Channel 2) WITHOUT triggering a response.
+
+        The Subconscious (second-brain L2) surfaces one delta-event the speech
+        center will see on its next turn. Mirrors send_idle_signal's item.create
+        but deliberately OMITS _safe_response_create() — passivity is the whole
+        point. A spuriously-triggered response here is the same failure class as
+        the Inworld dangling-tool_call 400 (PR #19).
+        """
+        if not self.connection:
+            logger.debug("No connection, cannot inject passive item")
+            return
+        try:
+            await self.connection.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            )
+            logger.info("Subconscious injected passive item: %s", text)
+        except self._connection_closed_errors() as e:
+            logger.debug("Passive item inject skipped (connection closed?): %s", e)
