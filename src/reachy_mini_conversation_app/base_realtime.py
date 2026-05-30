@@ -720,6 +720,10 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         self._user_turn_count: int = 0
         # Subconscious v0: last user transcript, read by the watcher.
         self._last_user_transcript: str | None = None
+        # Highest user-turn count for which the subconscious has already run.
+        # Guards against re-running (and draining extra salient events) when an
+        # idle-signal response fires another response.done without a new turn.
+        self._last_subconscious_turn: int = 0
         # Share the SAME set object with deps so the enroll/correct tools and
         # the recognizer mutate one gray-zone continuity set. Attached here, by
         # the set; the connect-path reset clears IN PLACE (never rebinds) so
@@ -1079,6 +1083,22 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         if asyncio.get_event_loop().time() - ts > _FACE_STALE_SECONDS:
             return None
         return name
+
+    def _fresh_face_speaker_id(self) -> int | None:
+        """Return the recognized speaker's entity id, or None if stale/absent.
+
+        Mirrors _face_recognition_summary's staleness gate so the subconscious
+        never scopes retrieval to someone who has since left: a stale cache
+        falls back to shared-only retrieval (None) rather than surfacing the
+        departed person's private events to whoever is present now.
+        """
+        cached = self._latest_face_recognition
+        if cached is None:
+            return None
+        entity_id, _name, ts = cached
+        if asyncio.get_event_loop().time() - ts > _FACE_STALE_SECONDS:
+            return None
+        return entity_id
 
     async def _run_scene_observation(self, *, force: bool = False) -> None:
         """Run a SmolVLM2 scan of the current camera frame.
@@ -2646,11 +2666,17 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             return
         if self._user_turn_count % _SUBCONSCIOUS_EVERY_N_TURNS != 0:
             return
-        speaker_id = (
-            self._latest_face_recognition[0]
-            if self._latest_face_recognition
-            else None
-        )
+        # Run retrieval at most once per user-turn count. This method is fired on
+        # every response.done, and an idle-signal response can produce another
+        # response.done without a new user turn; without this gate, render_delta
+        # (which marks the event asked) would drain extra salient events between
+        # turns. Stamp synchronously BEFORE the first await — asyncio is
+        # cooperative, so check-then-stamp with no await between is atomic
+        # against a second task scheduled at the same turn count.
+        if self._user_turn_count == self._last_subconscious_turn:
+            return
+        self._last_subconscious_turn = self._user_turn_count
+        speaker_id = self._fresh_face_speaker_id()
         turn_text = self._last_user_transcript or ""
         try:
             text = await asyncio.to_thread(
