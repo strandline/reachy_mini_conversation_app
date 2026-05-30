@@ -1163,6 +1163,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                     self._latest_face_recognition = None
                     self._face_unrecognized_present = False
                     await self._release_face_pin()
+                    # Departure also drops session continuity, so a departed
+                    # person can't corroborate a later gray scan (L0b Leak #3,
+                    # second door). .clear() mutates in place — the set is shared
+                    # by identity with deps.session_recognized_ids.
+                    self._session_recognized_ids.clear()
                     return
 
                 match_set = await asyncio.to_thread(_MEMORY_STORE.get_face_match_set_sync)
@@ -1190,16 +1195,19 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                     )
                     await self.refresh_session_instructions()
                 elif tier == "gray":
-                    pinned = (
-                        await asyncio.to_thread(_SPEAKER_STATE.get_current_speaker)
-                        if _SPEAKER_STATE is not None
-                        else None
-                    )
-                    pinned_id = pinned["id"] if pinned else None
+                    # L0b Leak #3: corroborate a gray face ONLY by session
+                    # continuity (a prior HIGH-tier recognition this session,
+                    # cleared on departure) — NOT by the speaker pin. A stale or
+                    # voice-set pin survives a person swap, so a bare pin to A
+                    # would let B's gray-as-A scan self-accept as the departed A.
+                    # Session continuity is high-tier-only (gray-accepts are never
+                    # added, so no feedback path) and is cleared on the no-face /
+                    # unknown-face departure branches below — making it the only
+                    # departure-coherent corroborator.
                     if _FACE_MATCH.corroboration_ok(
                         d["entity_id"],
                         explicit_name_entity_id=None,
-                        pinned_entity_id=pinned_id,
+                        pinned_entity_id=None,
                         session_recognized_ids=self._session_recognized_ids,
                     ):
                         self._face_unrecognized_present = False
@@ -1291,6 +1299,9 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                     self._latest_face_recognition = None
                     self._face_unrecognized_present = True
                     await self._release_face_pin()
+                    # Drop session continuity on departure too (Leak #3, second
+                    # door) — before the fallible log write, like the pin release.
+                    self._session_recognized_ids.clear()
                     await asyncio.to_thread(
                         _MEMORY_STORE.log_face_sighting_sync,
                         entity_id=None,
@@ -1302,6 +1313,19 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             except Exception:
                 logger.exception("Face recognition failed")
                 return
+
+    def _schedule_turn_face_rescan(self) -> None:
+        """Fire a cooldown-gated face rescan on a user-turn boundary (L0b PR-2).
+
+        Face scans are otherwise idle-driven (startup + >60 s lulls), so during an
+        active back-and-forth a present, talking speaker is never re-confirmed and
+        ages out of the durable-write freshness window — forking a duplicate on a
+        novel name-variant. A user turn is the cheapest "they're still here"
+        signal; re-confirming each turn keeps a present face's pin re-stamped.
+        Fire-and-forget, cooldown-gated inside _run_face_recognition (most turns
+        no-op), never blocks the turn.
+        """
+        asyncio.create_task(self._run_face_recognition())
 
     async def _tag_identity(self, entity_id: int, name: str) -> None:
         """Pin the speaker and attribute them to the current episode.
@@ -2124,6 +2148,10 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         # state block reads this to gate the enrollment cue to
                         # an active conversant (not the pre-speech startup scan).
                         self._user_turn_count += 1
+                        # L0b PR-2: re-confirm the present face each turn so a
+                        # present speaker's pin stays write-fresh during active
+                        # talk (idle scans alone let it age out). Cooldown-gated.
+                        self._schedule_turn_face_rescan()
 
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None

@@ -509,18 +509,20 @@ async def test_run_face_recognition_gray_uncorroborated_is_noop(face_ctx):
 
 
 @pytest.mark.asyncio
-async def test_run_face_recognition_gray_corroborated_by_pin_accepts(face_ctx):
-    """A gray match corroborated by the current pin is accepted — but not promoted.
+async def test_run_face_recognition_gray_corroborated_by_session_accepts(face_ctx):
+    """A gray match corroborated by SESSION CONTINUITY (a prior high-tier
+    recognition this session) is accepted.
 
-    Accepting logs a reinforcement sighting (source='recognize'), keeps the pin,
-    attributes the participant, and caches — yet must NOT add to
-    _session_recognized_ids (that is HIGH-tier only; otherwise a pin-corroborated
-    gray-accept self-corroborates the next scan via "session continuity").
+    L0b Leak #3: the corroborator is the session-recognized set, NOT the speaker
+    pin — a stale or voice-set pin must not vouch for a gray face. Session
+    continuity is high-tier-only and is cleared on departure, so it can't survive
+    a person swap. Accepting logs a reinforcement sighting (source='recognize'),
+    attributes the participant, caches, and refreshes.
     """
     ctx = face_ctx
     eid = ctx.ms.upsert_entity_sync("Maya", kind="person")
     ctx.ms.seed_face_centroid_sync(eid, _onehot(0))
-    ctx.ss.set_current_speaker(eid, "Maya")  # pin corroborates the gray candidate
+    ctx.handler._session_recognized_ids.add(eid)  # prior high-tier recognition
     _set_probe(ctx, _gray_probe())
 
     await ctx.handler._run_face_recognition()
@@ -529,10 +531,9 @@ async def test_run_face_recognition_gray_corroborated_by_pin_accepts(face_ctx):
     assert len(sightings) == 1
     assert sightings[0]["entity_id"] == eid
     assert sightings[0]["source"] == "recognize"
-    assert ctx.ss.get_current_speaker()["id"] == eid
+    assert ctx.ss.get_current_speaker()["id"] == eid  # _tag_identity pins on accept
     assert "Maya" in _participants(ctx.ms, ctx.episode_id)
     assert ctx.handler._latest_face_recognition is not None
-    assert eid not in ctx.handler._session_recognized_ids  # gray must not promote
     ctx.refresh.assert_awaited()
 
 
@@ -614,12 +615,12 @@ async def test_run_face_recognition_gray_not_promoted_below_tau(face_ctx, monkey
 
 @pytest.mark.asyncio
 async def test_run_face_recognition_gray_corroboration_precedes_prior(face_ctx):
-    """A gray match that is BOTH pin-corroborated and high-prior reinforces.
+    """A gray match that is BOTH session-corroborated and high-prior reinforces.
 
-    Corroboration wins over the prior: the pin is per-frame proof the frame is
-    them, so it is a legitimate exemplar and gets logged (adapting the centroid).
-    The prior only rescues the UNcorroborated gray case; it must not suppress the
-    reinforcement an in-session pin already earns.
+    Corroboration wins over the prior: session continuity is per-frame-adjacent
+    proof the frame is them, so it is a legitimate exemplar and gets logged
+    (adapting the centroid). The prior only rescues the UNcorroborated gray case;
+    it must not suppress the reinforcement in-session continuity already earns.
     """
     ctx = face_ctx
     eid = ctx.ms.upsert_entity_sync("Maya", kind="person")
@@ -631,7 +632,7 @@ async def test_run_face_recognition_gray_corroboration_precedes_prior(face_ctx):
             entity_id=eid, episode_id=ctx.episode_id,
             embedding=_onehot(0), confidence=1.0, source="recognize",
         )
-    ctx.ss.set_current_speaker(eid, "Maya")  # pin corroborates the gray candidate
+    ctx.handler._session_recognized_ids.add(eid)  # session continuity corroborates
     _set_probe(ctx, _gray_probe())
 
     before = len(_all_sightings(ctx.ms))
@@ -642,8 +643,87 @@ async def test_run_face_recognition_gray_corroboration_precedes_prior(face_ctx):
     assert after[-1]["entity_id"] == eid
     assert after[-1]["source"] == "recognize"
     assert ctx.ss.get_current_speaker()["id"] == eid
-    assert eid not in ctx.handler._session_recognized_ids  # gray never session-adds
+    # Gray-accept reinforces but never EXPANDS continuity (else it self-
+    # corroborates the next scan) — the set is still just the seeded entity.
+    assert ctx.handler._session_recognized_ids == {eid}
     ctx.refresh.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_face_recognition_gray_not_corroborated_by_pin(face_ctx):
+    """L0b Leak #3: the speaker pin no longer vouches for a gray face.
+
+    A stale or voice-set pin to A must not let B's gray-as-A scan self-accept.
+    With no session continuity and no prior, a pinned gray candidate is a pure
+    no-op — the pin is dropped from the corroboration sources.
+    """
+    ctx = face_ctx
+    eid = ctx.ms.upsert_entity_sync("Maya", kind="person")
+    ctx.ms.seed_face_centroid_sync(eid, _onehot(0))
+    ctx.ss.set_current_speaker(eid, "Maya", source="face")  # pin must NOT corroborate
+    _set_probe(ctx, _gray_probe())
+
+    await ctx.handler._run_face_recognition()
+
+    assert _all_sightings(ctx.ms) == []  # not accepted
+    assert eid not in ctx.handler._session_recognized_ids
+    assert ctx.handler._latest_face_recognition is None
+    assert _participants(ctx.ms, ctx.episode_id) == []
+    ctx.refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_face_recognition_unknown_face_clears_session_continuity(face_ctx):
+    """L0b Leak #3 (second door): an unknown face (departure) clears session
+    continuity, so a departed person can't corroborate the next gray scan via the
+    session-recognized set.
+    """
+    ctx = face_ctx
+    eid = ctx.ms.upsert_entity_sync("Alice", kind="person")
+    ctx.ms.seed_face_centroid_sync(eid, _onehot(0))
+    _set_probe(ctx, _onehot(0))  # high-tier → recognized this session
+    await ctx.handler._run_face_recognition()
+    assert eid in ctx.handler._session_recognized_ids
+
+    _set_probe(ctx, _onehot(7))  # unknown face → departure
+    await ctx.handler._run_face_recognition(force=True)
+    assert eid not in ctx.handler._session_recognized_ids
+
+
+@pytest.mark.asyncio
+async def test_run_face_recognition_no_face_clears_session_continuity(face_ctx):
+    """L0b Leak #3 (second door): a vacated frame (no face) clears session
+    continuity too — same 'person left' semantics as the face-pin release.
+    """
+    ctx = face_ctx
+    eid = ctx.ms.upsert_entity_sync("Alice", kind="person")
+    ctx.ms.seed_face_centroid_sync(eid, _onehot(0))
+    _set_probe(ctx, _onehot(0))
+    await ctx.handler._run_face_recognition()
+    assert eid in ctx.handler._session_recognized_ids
+
+    ctx.recognizer.embed_largest.return_value = None  # no face in frame
+    await ctx.handler._run_face_recognition(force=True)
+    assert eid not in ctx.handler._session_recognized_ids
+
+
+@pytest.mark.asyncio
+async def test_schedule_turn_face_rescan_fires_recognition(face_ctx, monkeypatch):
+    """A user-turn boundary schedules a (cooldown-gated) face rescan.
+
+    Without it, scans are idle-driven only (startup + >60 s lulls), so a present,
+    actively-talking speaker is never re-confirmed and ages out of the PR-1
+    write-fresh window. The turn hook re-stamps a present face's pin each turn.
+    """
+    ctx = face_ctx
+    fired = asyncio.Event()
+
+    async def _spy(*args, **kwargs):
+        fired.set()
+
+    monkeypatch.setattr(ctx.handler, "_run_face_recognition", _spy)
+    ctx.handler._schedule_turn_face_rescan()
+    await asyncio.wait_for(fired.wait(), 1.0)
 
 
 @pytest.mark.asyncio
