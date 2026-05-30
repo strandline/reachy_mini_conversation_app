@@ -1257,14 +1257,19 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                             await self.refresh_session_instructions()
                         # else: uncorroborated gray, prior < tau → no-op
                 else:
-                    # Face detected but matched no one: keep the unmatched
-                    # sighting (offline review / later correction) and cue Bemo
-                    # to offer to remember them. Clear any prior recognition —
-                    # an unknown face present is a positive signal the previously
-                    # recognized speaker has left, so the state block must stop
-                    # naming them (and stop suppressing this newcomer's cue) AND
-                    # release a face-set speaker pin (voice-set pins survive —
-                    # see _release_face_pin).
+                    # Face detected but matched no one: an unknown face present
+                    # is a positive signal the previously recognized speaker has
+                    # left. Update the recognition state and release a face-set
+                    # speaker pin FIRST — before the fallible sighting write — so
+                    # a DB error on the log can't skip the departure release and
+                    # leave the departed person's context active while an unknown
+                    # replacement is here (Codex #22 P2). (Voice-set pins survive
+                    # — see _release_face_pin.) Then keep the unmatched sighting
+                    # for offline review / later correction and cue Bemo to offer
+                    # to remember them.
+                    self._latest_face_recognition = None
+                    self._face_unrecognized_present = True
+                    await self._release_face_pin()
                     await asyncio.to_thread(
                         _MEMORY_STORE.log_face_sighting_sync,
                         entity_id=None,
@@ -1273,9 +1278,6 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         confidence=d["score"],
                         source="recognize",
                     )
-                    self._latest_face_recognition = None
-                    self._face_unrecognized_present = True
-                    await self._release_face_pin()
             except Exception:
                 logger.exception("Face recognition failed")
                 return

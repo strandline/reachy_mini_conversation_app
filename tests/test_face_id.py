@@ -466,6 +466,31 @@ async def test_run_face_recognition_no_face_keeps_voice_set_pin(face_ctx):
 
 
 @pytest.mark.asyncio
+async def test_run_face_recognition_releases_pin_even_if_sighting_write_fails(
+    face_ctx, monkeypatch
+):
+    """Codex #22 P2: the face-pin release must fire even if the unknown-face
+    sighting write raises (DB locked/unavailable). The release must not sit
+    behind the fallible log write, or a DB hiccup leaves the departed person's
+    RELATIONSHIP CONTEXT active while an unknown replacement face is present —
+    the exact leak this branch closes.
+    """
+    ctx = face_ctx
+    alice = ctx.ms.upsert_entity_sync("Alice", kind="person")
+    ctx.ss.set_current_speaker(alice, "Alice", source="face")
+    _set_probe(ctx, _onehot(7))  # unknown face → NONE tier
+
+    def _boom(*a, **k):
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(ctx.ms, "log_face_sighting_sync", _boom)
+
+    await ctx.handler._run_face_recognition()  # must not raise (broad except)
+
+    assert ctx.ss.get_current_speaker() is None  # released despite the write failure
+
+
+@pytest.mark.asyncio
 async def test_run_face_recognition_gray_uncorroborated_is_noop(face_ctx):
     """A gray match with no corroboration is a pure no-op (no pin, no write, no refresh)."""
     ctx = face_ctx
