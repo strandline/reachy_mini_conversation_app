@@ -2040,6 +2040,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 self._session_recognized_ids.clear()
                 self._face_unrecognized_present = False
                 self._user_turn_count = 0
+                # Reset the subconscious stamp alongside its shadow counter:
+                # otherwise a stale stamp from the prior session suppresses the
+                # one new-session turn whose count equals it (count == stamp is
+                # indistinguishable from "already ran" without resetting here).
+                self._last_subconscious_turn = 0
                 if _CAPTURE_STORE is not None:
                     try:
                         self._capture_episode_id = await _CAPTURE_STORE.open_episode([])
