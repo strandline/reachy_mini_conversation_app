@@ -1674,6 +1674,10 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             cost += (getattr(inp, "audio_tokens", 0) or 0) * self.AUDIO_INPUT_COST_PER_1M / 1e6
             cost += (getattr(inp, "text_tokens", 0) or 0) * self.TEXT_INPUT_COST_PER_1M / 1e6
             cost += (getattr(inp, "image_tokens", 0) or 0) * self.IMAGE_INPUT_COST_PER_1M / 1e6
+            logger.info(
+                "[cache] cached_tokens=%s",
+                getattr(inp, "cached_tokens", 0) or 0,
+            )
         if out:
             cost += (getattr(out, "audio_tokens", 0) or 0) * self.AUDIO_OUTPUT_COST_PER_1M / 1e6
             cost += (getattr(out, "text_tokens", 0) or 0) * self.TEXT_OUTPUT_COST_PER_1M / 1e6
