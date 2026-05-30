@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -37,3 +38,67 @@ async def test_inject_passive_item_noop_without_connection():
     handler = _bare_handler()
     handler.connection = None
     await handler.inject_passive_item("[recall: x]")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_subconscious_injects_when_due(monkeypatch):
+    handler = _bare_handler()
+    handler._user_turn_count = 3            # divisible by N=3 → due
+    handler._latest_face_recognition = None
+    handler._last_user_transcript = "tell me about the car"
+    handler.inject_passive_item = AsyncMock()
+    handler._response_done_event = asyncio.Event()
+    handler._response_done_event.set()      # idle: safe to inject
+    fake = MagicMock()
+    fake.render_delta = MagicMock(return_value="[recall: the Miata]")
+    monkeypatch.setattr(base_realtime, "_SUBCONSCIOUS", fake)
+    monkeypatch.setattr(base_realtime, "_SUBCONSCIOUS_EVERY_N_TURNS", 3)
+
+    await handler._maybe_run_subconscious()
+
+    fake.render_delta.assert_called_once_with("tell me about the car", None)
+    handler.inject_passive_item.assert_awaited_once_with("[recall: the Miata]")
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_subconscious_skips_off_cadence(monkeypatch):
+    handler = _bare_handler()
+    handler._user_turn_count = 2            # 2 % 3 != 0 → skip
+    handler.inject_passive_item = AsyncMock()
+    monkeypatch.setattr(base_realtime, "_SUBCONSCIOUS", MagicMock())
+    monkeypatch.setattr(base_realtime, "_SUBCONSCIOUS_EVERY_N_TURNS", 3)
+
+    await handler._maybe_run_subconscious()
+
+    handler.inject_passive_item.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_subconscious_noop_when_module_absent(monkeypatch):
+    handler = _bare_handler()
+    handler._user_turn_count = 3
+    handler.inject_passive_item = AsyncMock()
+    monkeypatch.setattr(base_realtime, "_SUBCONSCIOUS", None)
+
+    await handler._maybe_run_subconscious()
+
+    handler.inject_passive_item.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_subconscious_skips_none_delta(monkeypatch):
+    handler = _bare_handler()
+    handler._user_turn_count = 3
+    handler._latest_face_recognition = None
+    handler._last_user_transcript = "x"
+    handler.inject_passive_item = AsyncMock()
+    handler._response_done_event = asyncio.Event()
+    handler._response_done_event.set()
+    fake = MagicMock()
+    fake.render_delta = MagicMock(return_value=None)   # nothing to surface
+    monkeypatch.setattr(base_realtime, "_SUBCONSCIOUS", fake)
+    monkeypatch.setattr(base_realtime, "_SUBCONSCIOUS_EVERY_N_TURNS", 3)
+
+    await handler._maybe_run_subconscious()
+
+    handler.inject_passive_item.assert_not_called()

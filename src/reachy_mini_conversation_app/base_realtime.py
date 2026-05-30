@@ -2127,6 +2127,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         self.is_idle_tool_call = False
                         logger.debug("Response done")
 
+                        # Subconscious v0: fire-and-forget the L2 watcher at the
+                        # idle boundary (event is now set). Never awaited here —
+                        # must not block the event loop.
+                        asyncio.create_task(self._maybe_run_subconscious())
+
                         response = getattr(event, "response", None)
                         usage = getattr(response, "usage", None) if response else None
                         if usage:
@@ -2191,6 +2196,7 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         # state block reads this to gate the enrollment cue to
                         # an active conversant (not the pre-speech startup scan).
                         self._user_turn_count += 1
+                        self._last_user_transcript = transcript
                         # L0b PR-2: re-confirm the present face each turn so a
                         # present speaker's pin stays write-fresh during active
                         # talk (idle scans alone let it age out). Cooldown-gated.
@@ -2623,3 +2629,36 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             logger.info("Subconscious injected passive item: %s", text)
         except self._connection_closed_errors() as e:
             logger.debug("Passive item inject skipped (connection closed?): %s", e)
+
+    async def _maybe_run_subconscious(self) -> None:
+        """Subconscious v0 tick (retrieval-only, no LLM). Fired at the
+        response.done idle boundary so the passive item is queued for the NEXT
+        turn and never races an active response. Degrades silently — must never
+        block or break the fast voice loop (second-brain-architecture.md:385).
+        """
+        if _SUBCONSCIOUS is None:
+            return
+        if self._user_turn_count == 0:
+            return
+        if self._user_turn_count % _SUBCONSCIOUS_EVERY_N_TURNS != 0:
+            return
+        speaker_id = (
+            self._latest_face_recognition[0]
+            if self._latest_face_recognition
+            else None
+        )
+        turn_text = self._last_user_transcript or ""
+        try:
+            text = await asyncio.to_thread(
+                _SUBCONSCIOUS.render_delta, turn_text, speaker_id
+            )
+        except Exception:
+            logger.exception("subconscious render_delta failed")
+            return
+        if not text:
+            return
+        # Re-check idle: a new response may have started while we retrieved.
+        # Same gate idiom as the idle-signal path (base_realtime.py idle check).
+        if not self._response_done_event.is_set():
+            return
+        await self.inject_passive_item(text)
