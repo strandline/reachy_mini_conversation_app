@@ -1137,8 +1137,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 probe = await asyncio.to_thread(recognizer.embed_largest, frame)
                 if probe is None:
                     # No face present → nobody to recognize, no cue to offer.
+                    # A vacated frame is departure for a face-set pin, so release
+                    # it (voice-set pins survive — see _release_face_pin).
                     self._latest_face_recognition = None
                     self._face_unrecognized_present = False
+                    await self._release_face_pin()
                     return
 
                 match_set = await asyncio.to_thread(_MEMORY_STORE.get_face_match_set_sync)
@@ -1259,7 +1262,9 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                     # to offer to remember them. Clear any prior recognition —
                     # an unknown face present is a positive signal the previously
                     # recognized speaker has left, so the state block must stop
-                    # naming them (and stop suppressing this newcomer's cue).
+                    # naming them (and stop suppressing this newcomer's cue) AND
+                    # release a face-set speaker pin (voice-set pins survive —
+                    # see _release_face_pin).
                     await asyncio.to_thread(
                         _MEMORY_STORE.log_face_sighting_sync,
                         entity_id=None,
@@ -1270,6 +1275,7 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                     )
                     self._latest_face_recognition = None
                     self._face_unrecognized_present = True
+                    await self._release_face_pin()
             except Exception:
                 logger.exception("Face recognition failed")
                 return
@@ -1293,6 +1299,30 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 await _CAPTURE_STORE.merge_participant(eid, name)
             except Exception:
                 logger.exception("merge_participant failed during _tag_identity")
+
+    async def _release_face_pin(self) -> None:
+        """Release the speaker pin on face departure — FACE-set pins only.
+
+        Counterpart to _tag_identity, called from the no-face / unknown-face
+        branches. A face-set pin asserts who is in front of the camera; an
+        absent or unmatched face falsifies that, so the pin is dropped and the
+        RELATIONSHIP CONTEXT block stops steering on the departed person — the
+        within-session person-swap fix (A4 cleared the pin only at episode
+        boundaries). A VOICE-set pin (read_dossier) is left intact: face
+        departure does not falsify a verbal identification, so it releases only
+        on the TTL or the episode-boundary clear. The provenance discrimination
+        lives in _speaker_state.clear_current_speaker(face_only=True).
+        """
+        if _SPEAKER_STATE is None:
+            return
+        try:
+            await asyncio.to_thread(
+                _SPEAKER_STATE.clear_current_speaker, face_only=True
+            )
+        except Exception:
+            logger.exception(
+                "clear_current_speaker(face_only) failed on face departure"
+            )
 
     async def _resolve_full_instructions(self) -> str:
         """Base instructions plus the dynamic state block."""

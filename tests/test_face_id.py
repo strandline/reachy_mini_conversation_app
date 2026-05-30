@@ -390,6 +390,81 @@ async def test_run_face_recognition_no_face_clears_flag(face_ctx):
     assert ctx.ss.get_current_speaker() is None
 
 
+# --- within-session person-swap: provenance-aware pin release ---
+# The departure half of the L0b "presence-bound disposition" slice. A4 cleared
+# the pin at episode boundaries; these cover the WITHIN-session swap (A pinned,
+# A leaves / an unknown face appears, B talks). A FACE-set pin is released on
+# face departure (the face evidence is falsified); a VOICE-set pin (read_dossier)
+# survives — an absent/unknown face does not falsify a verbal identification.
+
+
+@pytest.mark.asyncio
+async def test_run_face_recognition_none_tier_releases_face_set_pin(face_ctx):
+    """An unknown face releases a FACE-set pin — A left, B (unknown) is here.
+
+    Without this, the RELATIONSHIP CONTEXT block keeps steering on A's
+    disposition for B's turn (the within-session leak A4 left open).
+    """
+    ctx = face_ctx
+    alice = ctx.ms.upsert_entity_sync("Alice", kind="person")
+    ctx.ss.set_current_speaker(alice, "Alice", source="face")
+    _set_probe(ctx, _onehot(7))  # unknown face, orthogonal → NONE tier
+
+    await ctx.handler._run_face_recognition()
+
+    assert ctx.ss.get_current_speaker() is None  # face-set pin released
+
+
+@pytest.mark.asyncio
+async def test_run_face_recognition_none_tier_keeps_voice_set_pin(face_ctx):
+    """An unknown face does NOT release a VOICE-set pin (provenance guard).
+
+    Jason identified by voice (read_dossier), face unenrolled — the camera
+    seeing his unmatched face must keep his verbal identification. Guards
+    against a naive unconditional clear that would drop voice-only steering.
+    """
+    ctx = face_ctx
+    jason = ctx.ms.upsert_entity_sync("Jason", kind="person")
+    ctx.ss.set_current_speaker(jason, "Jason", source="voice")
+    _set_probe(ctx, _onehot(7))  # unknown face → NONE tier
+
+    await ctx.handler._run_face_recognition()
+
+    speaker = ctx.ss.get_current_speaker()
+    assert speaker is not None and speaker["id"] == jason  # voice pin survives
+
+
+@pytest.mark.asyncio
+async def test_run_face_recognition_no_face_releases_face_set_pin(face_ctx):
+    """A vacated frame (no face) releases a FACE-set pin — the person left."""
+    ctx = face_ctx
+    alice = ctx.ms.upsert_entity_sync("Alice", kind="person")
+    ctx.ss.set_current_speaker(alice, "Alice", source="face")
+    ctx.recognizer.embed_largest.return_value = None  # no face in frame
+
+    await ctx.handler._run_face_recognition()
+
+    assert ctx.ss.get_current_speaker() is None  # face-set pin released
+
+
+@pytest.mark.asyncio
+async def test_run_face_recognition_no_face_keeps_voice_set_pin(face_ctx):
+    """A vacated frame does NOT release a VOICE-set pin (provenance guard).
+
+    A voice-identified speaker out of frame (looking away, or face unenrolled)
+    keeps their steering — face absence is not departure for a verbal ID.
+    """
+    ctx = face_ctx
+    jason = ctx.ms.upsert_entity_sync("Jason", kind="person")
+    ctx.ss.set_current_speaker(jason, "Jason", source="voice")
+    ctx.recognizer.embed_largest.return_value = None  # no face in frame
+
+    await ctx.handler._run_face_recognition()
+
+    speaker = ctx.ss.get_current_speaker()
+    assert speaker is not None and speaker["id"] == jason  # voice pin survives
+
+
 @pytest.mark.asyncio
 async def test_run_face_recognition_gray_uncorroborated_is_noop(face_ctx):
     """A gray match with no corroboration is a pure no-op (no pin, no write, no refresh)."""
@@ -1287,6 +1362,33 @@ async def test_relationship_context_caps_per_kind(face_ctx):
     assert len(cues.split("; ")) == 2     # ≤2 cues
     assert len(care.split("; ")) == 1     # ≤1 caution
     assert len(shared.split("; ")) == 1   # ≤1 shared-history
+
+
+@pytest.mark.asyncio
+async def test_relationship_context_released_on_within_session_swap(face_ctx):
+    """The security PROPERTY (not just the mechanism): after a face-recognized
+    speaker departs mid-session, the next state block carries NO trace of their
+    RELATIONSHIP CONTEXT steering.
+
+    The 4 swap tests assert the pin cleared; this asserts what the pin clear is
+    FOR — that _build_state_block stops emitting the departed person's
+    disposition. Discriminating: without _release_face_pin, A's face-set pin
+    survives the unknown face and A's cue still renders for B's turn.
+    """
+    ctx = face_ctx
+    jid = ctx.ms.upsert_entity_sync("Jason", kind="person")
+    _seed_affective(ctx.ms, jid, "interaction_cue", ["loves octopuses"])
+    ctx.ss.set_current_speaker(jid, "Jason", source="face")  # face-recognized A
+
+    block_with_a = await ctx.handler._build_state_block()
+    assert "loves octopuses" in block_with_a  # A's steering is live
+
+    # A leaves; an unknown face (B) appears → face-set pin released.
+    _set_probe(ctx, _onehot(7))  # matches nobody → NONE tier
+    await ctx.handler._run_face_recognition(force=True)
+
+    block_after_swap = await ctx.handler._build_state_block()
+    assert "loves octopuses" not in block_after_swap  # B's block is clean
 
 
 def test_stm_buffer_frames_raw_turns_as_untrusted_record():
