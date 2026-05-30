@@ -176,6 +176,36 @@ def _load_face_match() -> Any:
 _FACE_MATCH = _load_face_match()
 
 
+def _load_subconscious() -> Any:
+    """Locate and import bemo-reachy's _subconscious, or return None.
+
+    Second-brain L2 (Subconscious v0): the transcript-watcher's retrieval/
+    render logic lives in the workspace's tools/ dir. Same path-discovery
+    pattern as _load_event_store; the watcher no-ops when this returns None,
+    so a standalone conv-app checkout is unaffected.
+    """
+    tools_dir = os.environ.get("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
+    if not tools_dir:
+        return None
+    tools_dir = os.path.abspath(os.path.expanduser(tools_dir))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import _subconscious  # type: ignore[import-not-found]
+        return _subconscious
+    except ImportError:
+        return None
+
+
+_SUBCONSCIOUS = _load_subconscious()
+
+# Subconscious v0 cadence: run the watcher every Nth user turn (the forced
+# one-beat lag makes per-turn pointless; see second-brain-architecture.md:181).
+_SUBCONSCIOUS_EVERY_N_TURNS = int(
+    os.environ.get("REACHY_MINI_SUBCONSCIOUS_EVERY_N", "3")
+)
+
+
 # Slice D: affective self_note kinds split into two trust tiers.
 #   STEERING — tone/handling metadata Bemo acts on but must NEVER speak
 #     ("don't recite that you're being warm because he's your creator").
@@ -688,6 +718,12 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         self._session_recognized_ids: set[int] = set()
         self._face_unrecognized_present: bool = False
         self._user_turn_count: int = 0
+        # Subconscious v0: last user transcript, read by the watcher.
+        self._last_user_transcript: str | None = None
+        # Highest user-turn count for which the subconscious has already run.
+        # Guards against re-running (and draining extra salient events) when an
+        # idle-signal response fires another response.done without a new turn.
+        self._last_subconscious_turn: int = 0
         # Share the SAME set object with deps so the enroll/correct tools and
         # the recognizer mutate one gray-zone continuity set. Attached here, by
         # the set; the connect-path reset clears IN PLACE (never rebinds) so
@@ -1047,6 +1083,22 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
         if asyncio.get_event_loop().time() - ts > _FACE_STALE_SECONDS:
             return None
         return name
+
+    def _fresh_face_speaker_id(self) -> int | None:
+        """Return the recognized speaker's entity id, or None if stale/absent.
+
+        Mirrors _face_recognition_summary's staleness gate so the subconscious
+        never scopes retrieval to someone who has since left: a stale cache
+        falls back to shared-only retrieval (None) rather than surfacing the
+        departed person's private events to whoever is present now.
+        """
+        cached = self._latest_face_recognition
+        if cached is None:
+            return None
+        entity_id, _name, ts = cached
+        if asyncio.get_event_loop().time() - ts > _FACE_STALE_SECONDS:
+            return None
+        return entity_id
 
     async def _run_scene_observation(self, *, force: bool = False) -> None:
         """Run a SmolVLM2 scan of the current camera frame.
@@ -1642,6 +1694,10 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             cost += (getattr(inp, "audio_tokens", 0) or 0) * self.AUDIO_INPUT_COST_PER_1M / 1e6
             cost += (getattr(inp, "text_tokens", 0) or 0) * self.TEXT_INPUT_COST_PER_1M / 1e6
             cost += (getattr(inp, "image_tokens", 0) or 0) * self.IMAGE_INPUT_COST_PER_1M / 1e6
+            logger.info(
+                "[cache] cached_tokens=%s",
+                getattr(inp, "cached_tokens", 0) or 0,
+            )
         if out:
             cost += (getattr(out, "audio_tokens", 0) or 0) * self.AUDIO_OUTPUT_COST_PER_1M / 1e6
             cost += (getattr(out, "text_tokens", 0) or 0) * self.TEXT_OUTPUT_COST_PER_1M / 1e6
@@ -1984,6 +2040,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 self._session_recognized_ids.clear()
                 self._face_unrecognized_present = False
                 self._user_turn_count = 0
+                # Reset the subconscious stamp alongside its shadow counter:
+                # otherwise a stale stamp from the prior session suppresses the
+                # one new-session turn whose count equals it (count == stamp is
+                # indistinguishable from "already ran" without resetting here).
+                self._last_subconscious_turn = 0
                 if _CAPTURE_STORE is not None:
                     try:
                         self._capture_episode_id = await _CAPTURE_STORE.open_episode([])
@@ -2095,6 +2156,11 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         self.is_idle_tool_call = False
                         logger.debug("Response done")
 
+                        # Subconscious v0: fire-and-forget the L2 watcher at the
+                        # idle boundary (event is now set). Never awaited here —
+                        # must not block the event loop.
+                        asyncio.create_task(self._maybe_run_subconscious())
+
                         response = getattr(event, "response", None)
                         usage = getattr(response, "usage", None) if response else None
                         if usage:
@@ -2159,6 +2225,7 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                         # state block reads this to gate the enrollment cue to
                         # an active conversant (not the pre-speech startup scan).
                         self._user_turn_count += 1
+                        self._last_user_transcript = transcript
                         # L0b PR-2: re-confirm the present face each turn so a
                         # present speaker's pin stays write-fresh during active
                         # talk (idle scans alone let it age out). Cooldown-gated.
@@ -2567,3 +2634,66 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             },
         )
         await self._safe_response_create()
+
+    async def inject_passive_item(self, text: str) -> None:
+        """Inject a passive context item (Channel 2) WITHOUT triggering a response.
+
+        The Subconscious (second-brain L2) surfaces one delta-event the speech
+        center will see on its next turn. Mirrors send_idle_signal's item.create
+        but deliberately OMITS _safe_response_create() — passivity is the whole
+        point. A spuriously-triggered response here is the same failure class as
+        the Inworld dangling-tool_call 400 (PR #19).
+        """
+        if not self.connection:
+            logger.debug("No connection, cannot inject passive item")
+            return
+        try:
+            await self.connection.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            )
+            logger.info("Subconscious injected passive item: %s", text)
+        except self._connection_closed_errors() as e:
+            logger.debug("Passive item inject skipped (connection closed?): %s", e)
+
+    async def _maybe_run_subconscious(self) -> None:
+        """Subconscious v0 tick (retrieval-only, no LLM). Fired at the
+        response.done idle boundary so the passive item is queued for the NEXT
+        turn and never races an active response. Degrades silently — must never
+        block or break the fast voice loop (second-brain-architecture.md:385).
+        """
+        if _SUBCONSCIOUS is None:
+            return
+        if self._user_turn_count == 0:
+            return
+        if self._user_turn_count % _SUBCONSCIOUS_EVERY_N_TURNS != 0:
+            return
+        # Run retrieval at most once per user-turn count. This method is fired on
+        # every response.done, and an idle-signal response can produce another
+        # response.done without a new user turn; without this gate, render_delta
+        # (which marks the event asked) would drain extra salient events between
+        # turns. Stamp synchronously BEFORE the first await — asyncio is
+        # cooperative, so check-then-stamp with no await between is atomic
+        # against a second task scheduled at the same turn count.
+        if self._user_turn_count == self._last_subconscious_turn:
+            return
+        self._last_subconscious_turn = self._user_turn_count
+        speaker_id = self._fresh_face_speaker_id()
+        turn_text = self._last_user_transcript or ""
+        try:
+            text = await asyncio.to_thread(
+                _SUBCONSCIOUS.render_delta, turn_text, speaker_id
+            )
+        except Exception:
+            logger.exception("subconscious render_delta failed")
+            return
+        if not text:
+            return
+        # Re-check idle: a new response may have started while we retrieved.
+        # Same gate idiom as the idle-signal path (base_realtime.py idle check).
+        if not self._response_done_event.is_set():
+            return
+        await self.inject_passive_item(text)
