@@ -1178,17 +1178,17 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
 
                 if tier == "match":
                     self._face_unrecognized_present = False
-                    # Identity switch (Leak #3, Codex #26 P1): a high-tier match of
-                    # a DIFFERENT person than last seen, with no intervening
-                    # no-face/unknown frame to clear continuity, must not leave the
-                    # prior person in _session_recognized_ids — a later gray-as-them
-                    # scan would self-corroborate against the departed person. Reset
-                    # continuity on the switch. (prev is None ⇒ session start or
-                    # post-departure: the set is already empty, so .clear() is a
-                    # no-op; same person re-recognized ⇒ continuity preserved.)
-                    prev = self._latest_face_recognition
-                    if prev is None or prev[0] != d["entity_id"]:
-                        self._session_recognized_ids.clear()
+                    # Reset session continuity to EXACTLY the matched person
+                    # (Leak #3, Codex #26 P1 + follow-up). Any other entity must
+                    # not linger to corroborate a later gray scan — including one a
+                    # prior-promoted gray accept left in _latest_face_recognition
+                    # WITHOUT joining continuity (so a "clear only when _latest
+                    # differs" check would wrongly skip it). Clearing
+                    # unconditionally also preserves same-person continuity
+                    # (re-adding the same id below is a no-op). .clear() mutates in
+                    # place — the set is shared by identity with
+                    # deps.session_recognized_ids.
+                    self._session_recognized_ids.clear()
                     await asyncio.to_thread(
                         _MEMORY_STORE.log_face_sighting_sync,
                         entity_id=d["entity_id"],

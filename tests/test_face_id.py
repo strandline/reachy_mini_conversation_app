@@ -713,6 +713,29 @@ async def test_run_face_recognition_high_tier_switch_clears_prior_continuity(fac
 
 
 @pytest.mark.asyncio
+async def test_high_tier_match_resets_continuity_to_current_person(face_ctx):
+    """Codex #26 P1 (follow-up): a high-tier match must RESET session continuity to
+    exactly the matched person, not just clear when _latest_face_recognition
+    differs. A prior-promoted gray accept of B leaves _latest=B while A still
+    lingers in the set (prior-promotes don't join continuity); a naive
+    prev[0]==entity check would then skip the clear and leave {A,B}, so a later
+    gray-as-A scan self-corroborates against departed A.
+    """
+    ctx = face_ctx
+    a = ctx.ms.upsert_entity_sync("Alice", kind="person")
+    b = ctx.ms.upsert_entity_sync("Bob", kind="person")
+    ctx.ms.seed_face_centroid_sync(b, _onehot(1))
+    # Reproduce the post-prior-promote state: A lingering, _latest already at B.
+    ctx.handler._session_recognized_ids.add(a)
+    ctx.handler._latest_face_recognition = (b, "Bob", 1.0)
+    _set_probe(ctx, _onehot(1))  # B high-tier
+
+    await ctx.handler._run_face_recognition(force=True)
+
+    assert ctx.handler._session_recognized_ids == {b}  # reset to current; A gone
+
+
+@pytest.mark.asyncio
 async def test_run_face_recognition_no_face_clears_session_continuity(face_ctx):
     """L0b Leak #3 (second door): a vacated frame (no face) clears session
     continuity too — same 'person left' semantics as the face-pin release.
