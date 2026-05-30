@@ -691,6 +691,28 @@ async def test_run_face_recognition_unknown_face_clears_session_continuity(face_
 
 
 @pytest.mark.asyncio
+async def test_run_face_recognition_high_tier_switch_clears_prior_continuity(face_ctx):
+    """L0b Leak #3 (Codex #26 P1): a direct high-tier A→B switch (no intervening
+    no-face/unknown departure frame) must not leave A in session continuity, or a
+    later gray-as-A scan of present B self-corroborates against the departed A.
+    """
+    ctx = face_ctx
+    a = ctx.ms.upsert_entity_sync("Alice", kind="person")
+    b = ctx.ms.upsert_entity_sync("Bob", kind="person")
+    ctx.ms.seed_face_centroid_sync(a, _onehot(0))
+    ctx.ms.seed_face_centroid_sync(b, _onehot(1))
+
+    _set_probe(ctx, _onehot(0))  # A high-tier
+    await ctx.handler._run_face_recognition()
+    assert a in ctx.handler._session_recognized_ids
+
+    _set_probe(ctx, _onehot(1))  # B high-tier, directly — no departure between
+    await ctx.handler._run_face_recognition(force=True)
+    assert b in ctx.handler._session_recognized_ids
+    assert a not in ctx.handler._session_recognized_ids  # switch cleared A
+
+
+@pytest.mark.asyncio
 async def test_run_face_recognition_no_face_clears_session_continuity(face_ctx):
     """L0b Leak #3 (second door): a vacated frame (no face) clears session
     continuity too — same 'person left' semantics as the face-pin release.
