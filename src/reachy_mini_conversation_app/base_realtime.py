@@ -279,6 +279,27 @@ def _format_stm_buffer(buf: dict[str, Any]) -> str | None:
     return "\n".join(lines)
 
 
+def _inject_state_block(session_config: Any, state_block: str) -> Any:
+    """Append the dynamic state block to a session config's instructions.
+
+    Handles both backend shapes: OpenAI/HF/Gemini return a
+    RealtimeSessionCreateRequestParam (attribute access), while Inworld returns
+    a plain dict (item access — see inworld_realtime._get_session_config). The
+    original session-start code only did attribute assignment, which raised
+    AttributeError on Inworld's dict and silently dropped the state block at
+    session open. Mutates in place and returns the config.
+    """
+    if not state_block:
+        return session_config
+    if isinstance(session_config, dict):
+        base = session_config.get("instructions") or ""
+        session_config["instructions"] = f"{base}\n\n{state_block}"
+    else:
+        base = getattr(session_config, "instructions", None) or ""
+        session_config.instructions = f"{base}\n\n{state_block}"
+    return session_config
+
+
 def _event_label(ev: dict[str, Any]) -> str:
     """Return a short event line: title + a date hint (original phrasing if kept)."""
     title = (ev.get("title") or "something").strip()
@@ -1896,13 +1917,18 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 # backend's resolved instructions before sending.
                 state_block = await self._build_state_block()
                 if state_block:
-                    base = getattr(session_config, "instructions", None) or ""
                     try:
-                        session_config.instructions = f"{base}\n\n{state_block}"
+                        # Shape-agnostic: dict (Inworld) or param object
+                        # (OpenAI/HF/Gemini). The old attribute-only assignment
+                        # raised on Inworld's dict and dropped the block.
+                        session_config = _inject_state_block(
+                            session_config, state_block
+                        )
                     except Exception:
                         logger.warning(
-                            "Could not append state block to session_config; "
-                            "instructions field is non-writable on this backend"
+                            "Could not append state block to session_config "
+                            "(unexpected config shape %s)",
+                            type(session_config).__name__,
                         )
                 await conn.session.update(session=session_config)
                 logger.info(
