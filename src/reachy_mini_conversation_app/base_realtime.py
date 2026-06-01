@@ -966,6 +966,25 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
             except Exception:
                 logger.exception("relationship context build failed")
 
+        # Group rosters (member_of graph): ground membership questions so she
+        # answers who's-in-which-circle from structure instead of improvising.
+        # Speaker-scoped; the full block is rendered by the outer store and
+        # injected verbatim (all logic lives in tools/_memory_store.py).
+        if _SPEAKER_STATE is not None and _MEMORY_STORE is not None:
+            try:
+                speaker = await asyncio.to_thread(
+                    _SPEAKER_STATE.get_current_speaker
+                )
+                if speaker is not None:
+                    grp = await asyncio.to_thread(
+                        _MEMORY_STORE.render_speaker_group_context_sync,
+                        speaker["id"],
+                    )
+                    if grp:
+                        lines.append(grp)
+            except Exception:
+                logger.exception("group context build failed")
+
         # C1 event ledger: what's coming up / just happened for the recognized
         # speaker. Speaker-scoped like the STM buffer — the face cache carries the
         # entity_id, freshness-gated via _face_recognition_summary; an unknown face
