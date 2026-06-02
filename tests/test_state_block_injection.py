@@ -10,7 +10,10 @@ session open (backfilled only seconds later by the first refresh). This pins the
 shape-agnostic injection that fixes it.
 """
 
-from reachy_mini_conversation_app.base_realtime import _inject_state_block
+from reachy_mini_conversation_app.base_realtime import (
+    _inject_state_block,
+    _format_entity_roster,
+)
 
 
 class _ObjConfig:
@@ -46,3 +49,28 @@ def test_inject_into_dict_without_instructions_key():
     cfg = {"type": "realtime"}
     _inject_state_block(cfg, "STATE BLOCK")
     assert cfg["instructions"] == "\n\nSTATE BLOCK"
+
+
+def test_roster_excludes_pets_so_household_line_owns_them():
+    # The "Known entities" roster excludes pets: the authoritative Household line
+    # renders the speaker's pets with ownership, and a flat all-households pet
+    # list with no ownership gets conflated into "our household" (e.g. another
+    # household's dog). People/places/topics still appear.
+    entities = [
+        {"name": "Jason", "kind": "person"},
+        {"name": "Sammy", "kind": "pet", "extra": {"species": "dog"}},
+        {"name": "Seattle", "kind": "place"},
+    ]
+    roster = _format_entity_roster(entities, exclude_kinds=frozenset({"pet"}))
+    assert "Jason" in roster
+    assert "Seattle" in roster
+    assert "Sammy" not in roster
+    assert "pets:" not in roster
+
+
+def test_roster_without_exclusion_still_lists_pets():
+    # Formatter stays general: with no exclusion, pets render with species (only
+    # the state-block call site opts into excluding them).
+    entities = [{"name": "Gingy", "kind": "pet", "extra": {"species": "cat"}}]
+    roster = _format_entity_roster(entities)
+    assert "Gingy (cat)" in roster

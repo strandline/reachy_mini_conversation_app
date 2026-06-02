@@ -397,6 +397,7 @@ def _format_entity_roster(
     *,
     max_per_kind: int = 12,
     max_total: int = 40,
+    exclude_kinds: "frozenset[str]" = frozenset(),
 ) -> str:
     """Render entities as a per-kind comma list for the state block.
 
@@ -407,12 +408,20 @@ def _format_entity_roster(
     LLM never has to guess which entity is a dog vs a cat. Truncated at
     `max_per_kind` per group and `max_total` overall; the rest are
     summarized as "(+N more)".
+
+    `exclude_kinds` drops whole kinds from the roster — the state-block call
+    site excludes "pet" because the authoritative Household line renders the
+    speaker's pets with ownership (see that call site for why a flat pet list
+    misleads).
     """
     if not entities:
         return ""
     by_kind: dict[str, list[dict[str, Any]]] = {}
     for e in entities:
-        by_kind.setdefault(e.get("kind", "thing"), []).append(e)
+        kind = e.get("kind", "thing")
+        if kind in exclude_kinds:
+            continue
+        by_kind.setdefault(kind, []).append(e)
     parts: list[str] = []
     total = 0
     # Stable ordering: person → pet → place → organization → … alphabetical fallback
@@ -928,17 +937,20 @@ class BaseRealtimeHandler(ConversationHandler, ABC):
                 "offer to remember them if it feels natural)"
             )
 
-        # Slice C (Slice B preview): entity roster grouped by kind. Walking
-        # in with "Jason's pets: Gingy (cat), Nut (cat), Amelia (dog), …"
-        # eliminates the category-confusion failure mode where Bemo, asked
-        # about "the dogs", picked the freshest entities in working memory
-        # (Gingy and Nut, who are cats) and hallucinated their species.
+        # Slice C (Slice B preview): entity roster grouped by kind, for name/
+        # topic awareness. PETS ARE EXCLUDED here: the authoritative "Household:"
+        # line below (render_speaker_group_context_sync) renders the speaker's
+        # pets WITH species and ownership. A flat all-households pet list has no
+        # ownership, so the fast model conflates it into "our household" — e.g.
+        # listing Christy's dog Sammy among Jason's pets. The Household line now
+        # serves the species-disambiguation this roster's pets were added for.
         if _MEMORY_STORE is not None:
             try:
                 entities = await asyncio.to_thread(
                     _MEMORY_STORE.list_all_entities_sync
                 )
-                roster = _format_entity_roster(entities)
+                roster = _format_entity_roster(
+                    entities, exclude_kinds=frozenset({"pet"}))
                 if roster:
                     lines.append(f"Known entities — {roster}")
             except Exception:
